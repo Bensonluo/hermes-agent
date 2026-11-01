@@ -316,7 +316,7 @@ class TestWeixinChunkDelivery:
         # rate-limited redelivery lane either (its retries are timer-based and would duplicate
         # text the hold queue already owns).
         assert classify_send_error(weixin._session_not_ready_error(-2, None, "prepare failed")) != "rate_limited"
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["hello"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["hello"]]
         assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == (
             [None] if stored_token is None else ["ctx-token", None])
 

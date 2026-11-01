@@ -95,7 +95,7 @@ class TestWeixinHeldOutbound:
         # make callers retry a send iLink keeps refusing until the peer speaks.
         assert result.success is True
         assert result.raw_response["queued"] is True
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["the report"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["the report"]]
 
         # The peer messages again: the fresh context_token reopens the window, so the held reply goes out.
         send_message_mock.reset_mock()
@@ -122,12 +122,12 @@ class TestWeixinHeldOutbound:
         adapter._hold_outbound_text("wxid_test123", ["two"])
         adapter._hold_outbound_text("wxid_test123", ["three"])
 
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["two"], ["three"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["two"], ["three"]]
 
-        adapter._held_outbound["wxid_test123"][0] = (time.time() - 31, ["stale"])
+        adapter._held_outbound["wxid_test123"][0] = (time.time() - 31, ["stale"], 30)
         adapter._hold_outbound_text("wxid_test123", ["four"])
 
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["three"], ["four"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["three"], ["four"]]
 
     def test_same_text_is_not_held_twice(self):
         """A refused reply gets retried many times over; one queue copy per attempt would flush
@@ -139,7 +139,7 @@ class TestWeixinHeldOutbound:
         third = adapter._hold_outbound_text("wxid_test123", ["other text"])
 
         assert (first, second, third) == (1, 1, 2)
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["same text"], ["other text"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["same text"], ["other text"]]
 
 
 class TestWeixinHeldOutboundTimeline:
@@ -165,7 +165,7 @@ class TestWeixinHeldOutboundTimeline:
             assert result.success is True
             assert result.raw_response["queued"] is True
             assert bridge.texts == ["one"]
-            assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["two", "three"]]
+            assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["two", "three"]]
 
             # The peer messages again: the fresh context_token reopens the window (and it stays open).
             bridge.window_open = True
@@ -195,7 +195,7 @@ class TestWeixinHeldOutboundTimeline:
             asyncio.run(adapter._flush_held_outbound("wxid_test123"))
 
         assert bridge.texts == ["a"]
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["b", "c"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["b", "c"]]
 
     @patch("plugins.platforms.weixin.adapter.asyncio.sleep", new_callable=AsyncMock)
     def test_flush_preserves_order_across_several_held_replies(self, sleep_mock):
@@ -230,13 +230,12 @@ class TestWeixinHeldOutboundTimeline:
         assert "wxid_test123" not in adapter._held_outbound
 
     @patch("plugins.platforms.weixin.adapter.asyncio.sleep", new_callable=AsyncMock)
-    def test_flush_drops_a_reply_that_died_of_old_age(self, sleep_mock):
-        """TTL is a maximum lifetime, not an enqueue-only cleanup rule: a reply the peer never
-        saw inside the window must be dropped, not delivered minutes later as if the
-        conversation were still live."""
+    def test_flush_drops_an_expired_intermediate_update(self, sleep_mock):
+        """TTL bounds intermediate updates only: a progress line the peer never saw inside the
+        window is dropped, not delivered much later as if the conversation were still live."""
         adapter = self._connected_adapter()
         adapter._held_outbound_ttl_seconds = 60
-        adapter._held_outbound["wxid_test123"] = [(time.time() - 61.0, ["stale reply"])]
+        adapter._held_outbound["wxid_test123"] = [(time.time() - 61.0, ["stale progress"], 60)]
         bridge = _FakeILinkBridge(window_open=True)
 
         with patch("plugins.platforms.weixin.adapter._send_message", new=bridge):
@@ -246,11 +245,55 @@ class TestWeixinHeldOutboundTimeline:
         assert "wxid_test123" not in adapter._held_outbound
 
     @patch("plugins.platforms.weixin.adapter.asyncio.sleep", new_callable=AsyncMock)
+    def test_a_final_reply_never_expires(self, sleep_mock):
+        """A turn's final reply (``metadata["ledgered_final"]``) is the result the user is owed;
+        held overnight — or over a weekend — it still flushes on the peer's next inbound."""
+        adapter = self._connected_adapter()
+        bridge = _FakeILinkBridge(window_open=False)  # the window is already closed
+
+        with patch("plugins.platforms.weixin.adapter._send_message", new=bridge):
+            result = asyncio.run(adapter._send_with_retry(chat_id="wxid_test123", content="overnight result"))
+
+        assert result.success is True
+        enqueued_at, chunks, ttl = adapter._held_outbound["wxid_test123"][0]
+        assert chunks == ["overnight result"]
+        assert ttl == float("inf")
+
+        # 25 hours later the peer returns: the final reply still goes out.
+        adapter._held_outbound["wxid_test123"] = [(enqueued_at - 90000.0, chunks, ttl)]
+        bridge.window_open = True
+        with patch("plugins.platforms.weixin.adapter._send_message", new=bridge):
+            asyncio.run(adapter._flush_held_outbound("wxid_test123"))
+
+        assert bridge.texts == ["overnight result"]
+        assert "wxid_test123" not in adapter._held_outbound
+
+    def test_the_gateway_final_path_marks_the_send_and_the_direct_path_does_not(self):
+        """The gateway sends ledgered finals through ``_send_with_retry`` (marked → held forever)
+        while typing notices / direct / cron pushes call ``send()`` directly (unmarked → bounded
+        TTL). Both behaviours verified end-to-end here so the two lanes cannot drift apart."""
+        async def _scenario():
+            adapter = self._connected_adapter()
+            bridge = _FakeILinkBridge(window_open=False)
+
+            with patch("plugins.platforms.weixin.adapter._send_message", new=bridge):
+                # Intermediate lane: a direct send is held with the bounded TTL...
+                await adapter.send("wxid_test123", "progress note")
+                # Final lane: the same text through the gateway's retry bracket is held forever.
+                await adapter._send_with_retry(chat_id="wxid_test123", content="turn result")
+            return adapter
+
+        adapter = asyncio.run(_scenario())
+        held = {chunks[0]: ttl for _, chunks, ttl in adapter._held_outbound["wxid_test123"]}
+        assert held["progress note"] == 3600.0
+        assert held["turn result"] == float("inf")
+
+    @patch("plugins.platforms.weixin.adapter.asyncio.sleep", new_callable=AsyncMock)
     def test_flush_still_delivers_a_reply_inside_its_ttl(self, sleep_mock):
         """Positive control for the expiry rule: one second of margin left is still a live reply."""
         adapter = self._connected_adapter()
         adapter._held_outbound_ttl_seconds = 60
-        adapter._held_outbound["wxid_test123"] = [(time.time() - 59.0, ["still warm"])]
+        adapter._held_outbound["wxid_test123"] = [(time.time() - 59.0, ["still warm"], 60)]
         bridge = _FakeILinkBridge(window_open=True)
 
         with patch("plugins.platforms.weixin.adapter._send_message", new=bridge):
@@ -272,7 +315,7 @@ class TestWeixinHeldOutboundTimeline:
             asyncio.run(adapter._flush_held_outbound("wxid_test123"))
 
         assert bridge.texts == ["a"]
-        assert [chunks for _, chunks in adapter._held_outbound["wxid_test123"]] == [["b"]]
+        assert [chunks for _, chunks, _ in adapter._held_outbound["wxid_test123"]] == [["b"]]
         assert adapter._held_outbound["wxid_test123"][0][0] == held_at
 
     @patch("plugins.platforms.weixin.adapter.asyncio.sleep", new_callable=AsyncMock)
@@ -316,7 +359,7 @@ class TestWeixinHeldOutboundHandoff:
         assert result.success is True
         assert result.raw_response["queued"] is True
         assert throwaway._held_outbound == {}
-        assert [chunks for _, chunks in live._held_outbound["wxid_test123"]] == [["queued for later"]]
+        assert [chunks for _, chunks, _ in live._held_outbound["wxid_test123"]] == [["queued for later"]]
 
     def test_direct_send_reports_a_queued_reply_as_accepted(self):
         async def _scenario():
@@ -358,7 +401,7 @@ class TestWeixinHeldOutboundHandoff:
 
         assert result.success is True
         assert result.raw_response["queued"] is True
-        assert [chunks for _, chunks in live._held_outbound["wxid_test123"]] == [["held by myself"]]
+        assert [chunks for _, chunks, _ in live._held_outbound["wxid_test123"]] == [["held by myself"]]
 
 
 class TestWeixinHeldOutboundLedgerCoordination:

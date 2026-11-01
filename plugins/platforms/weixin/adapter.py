@@ -4,7 +4,8 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid
+import asyncio, base64, contextlib, hashlib, json, logging, math, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid
+from contextvars import ContextVar
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -86,6 +87,13 @@ class PeerSessionNotReady(RuntimeError):
     is recoverable — ``WeixinAdapter`` holds it per peer and flushes it on that next inbound instead
     of discarding it (#135921).
     """
+
+
+# Set for the duration of a ledgered final-text send (``send_final_ledgered`` ->
+# ``_send_with_retry`` -> ``send``). The gateway's final reply is the result the user is owed, so
+# when the peer's window is closed it is held forever; every other send (typing notices, direct
+# and cron pushes, tool-initiated messages) is intermediate and keeps the bounded hold TTL.
+_final_send_ctx: ContextVar[bool] = ContextVar("weixin_final_send", default=False)
 
 
 def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> PeerSessionNotReady:
@@ -739,9 +747,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # Held outbound text: iLink will not prepare a bot-initiated send once this peer's reply
         # window has closed, so the undelivered chunks are kept per peer and flushed on that peer's
         # next inbound (see PeerSessionNotReady) instead of being dropped on the floor (#135921).
+        # Each entry carries its own TTL: math.inf for a turn's final reply (the result the user is
+        # owed — held however long it takes), the bounded default for intermediate updates.
         self._held_outbound_max = max(1, int(_extra_or_secret(extra, "held_outbound_max", "20")))
         self._held_outbound_ttl_seconds = float(_extra_or_secret(extra, "held_outbound_ttl_seconds", "3600"))
-        self._held_outbound: dict[str, list[tuple[float, list[str]]]] = {}
+        self._held_outbound: dict[str, list[tuple[float, list[str], float]]] = {}
         # Loop this adapter connected on. A throwaway adapter built off-loop (cron ``send_message``)
         # hands a hold to the live adapter through it instead of losing the queue with itself (#135921).
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1094,8 +1104,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     # messages the bot again. A throwaway adapter (cron ``send_message``) can never
                     # flush, so it hands the queue to the live adapter.
                     pending = chunks[idx:]
-                    if not self._hand_off_hold_to_live_adapter(chat_id, pending):
-                        depth = self._hold_outbound_text(chat_id, pending)
+                    hold_ttl = math.inf if _final_send_ctx.get() else self._held_outbound_ttl_seconds
+                    if not self._hand_off_hold_to_live_adapter(chat_id, pending, hold_ttl):
+                        depth = self._hold_outbound_text(chat_id, pending, ttl=hold_ttl)
                         logger.warning("[%s] peer session closed for %s; holding %d chunk(s) until their next message (queued=%d)",
                                        self.name, _safe_id(chat_id), len(pending), depth)
                     else:
@@ -1118,7 +1129,24 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
-    def _hand_off_hold_to_live_adapter(self, chat_id: str, chunks: list[str]) -> bool:
+    async def _send_with_retry(self, chat_id: str, content: str, reply_to: Optional[str] = None,
+                               metadata: Any = None, max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        """Mark this send as the turn's final text while it runs.
+
+        The gateway sends every ledgered final reply through ``_send_with_retry``; intermediate
+        traffic (typing notices, direct/cron pushes) calls ``send()`` directly. Setting the flag
+        here — instead of threading a parameter through the platform-neutral ``send`` interface —
+        lets ``send()`` hold a refused final reply forever (``_final_send_ctx``) while everything
+        else keeps the bounded hold TTL, without touching shared gateway code."""
+        marker = _final_send_ctx.set(True)
+        try:
+            return await super()._send_with_retry(
+                chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata,
+                max_retries=max_retries, base_delay=base_delay)
+        finally:
+            _final_send_ctx.reset(marker)
+
+    def _hand_off_hold_to_live_adapter(self, chat_id: str, chunks: list[str], ttl: float) -> bool:
         """Give a hold to the live adapter when ``self`` is a throwaway instance, else ``False``.
 
         ``send_weixin_direct`` builds a short-lived adapter whenever the live session sits on
@@ -1132,30 +1160,35 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if loop is None or loop.is_closed():
             return False
         try:
-            loop.call_soon_threadsafe(live._hold_outbound_text, chat_id, list(chunks))
+            loop.call_soon_threadsafe(live._hold_outbound_text, chat_id, list(chunks), None, ttl)
         except RuntimeError:  # the loop closed between the check and the call
             return False
         return True
 
-    def _hold_outbound_text(self, chat_id: str, chunks: list[str], enqueued_at: Optional[float] = None) -> int:
+    def _hold_outbound_text(self, chat_id: str, chunks: list[str], enqueued_at: Optional[float] = None,
+                            ttl: Optional[float] = None) -> int:
         """Keep text iLink refused for this peer until their next inbound; returns the new queue depth.
 
         ``enqueued_at`` carries the original deadline when a refused flush re-holds a reply, so
-        re-queueing can never extend a message's life past ``held_outbound_ttl_seconds``. Text
-        already pending is never queued twice: a refused reply gets retried many times over, and
-        one copy per attempt would fill the queue with the same text and flush it all at once."""
+        re-queueing can never extend a message's life past its own TTL. ``ttl`` bounds the hold:
+        ``math.inf`` (a turn's final reply — the result the user is owed, valuable however much
+        later the peer returns) never expires; anything else defaults to the intermediate-update
+        TTL. Text already pending is never queued twice: a refused reply gets retried many times
+        over, and one copy per attempt would fill the queue with the same text and flush it all
+        at once."""
         queue = self._held_outbound.setdefault(chat_id, [])
+        expires_after = self._held_outbound_ttl_seconds if ttl is None else ttl
         now = time.time()
-        keep = [entry for entry in queue if now - entry[0] <= self._held_outbound_ttl_seconds]
+        keep = [entry for entry in queue if now - entry[0] <= entry[2]]
         if len(keep) != len(queue):
-            logger.warning("[%s] %d held outbound message(s) for %s expired after %.0fs without an inbound",
-                           self.name, len(queue) - len(keep), _safe_id(chat_id), self._held_outbound_ttl_seconds)
+            logger.warning("[%s] %d held outbound message(s) for %s expired after their TTL without an inbound",
+                           self.name, len(queue) - len(keep), _safe_id(chat_id))
         queue[:] = keep
-        if any(pending == chunks for _, pending in queue):
+        if any(pending == chunks for _, pending, _ in queue):
             logger.warning("[%s] %s already has this text held; not queueing a duplicate copy",
                            self.name, _safe_id(chat_id))
             return len(queue)
-        queue.append((now if enqueued_at is None else enqueued_at, list(chunks)))
+        queue.append((now if enqueued_at is None else enqueued_at, list(chunks), expires_after))
         overflow = len(queue) - self._held_outbound_max
         if overflow > 0:
             del queue[:overflow]
@@ -1166,17 +1199,18 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def _flush_held_outbound(self, chat_id: str) -> None:
         """Re-send text held while this peer's reply window was closed. Called from
         ``_process_message`` once the inbound refreshed the ``context_token``; everything still
-        refused is held again under its original deadline, never dropped, and a reply that died of
-        old age is dropped instead of delivered late."""
+        refused is held again under its original deadline, never dropped. A turn's final reply
+        never expires; an intermediate update that outlived its TTL is dropped instead of
+        delivered late."""
         pending = self._held_outbound.pop(chat_id, None)
         if not pending:
             return
         logger.info("[%s] flushing %d held outbound message(s) to %s", self.name, len(pending), _safe_id(chat_id))
-        for index, (enqueued_at, chunks) in enumerate(pending):
+        for index, (enqueued_at, chunks, expires_after) in enumerate(pending):
             age = time.time() - enqueued_at
-            if age > self._held_outbound_ttl_seconds:
-                logger.warning("[%s] dropping %d held chunk(s) for %s: expired %.0fs after being queued",
-                               self.name, len(chunks), _safe_id(chat_id), age)
+            if age > expires_after:
+                logger.warning("[%s] dropping %d held chunk(s) for %s: expired %.0fs after being queued (TTL %.0fs)",
+                               self.name, len(chunks), _safe_id(chat_id), age, expires_after)
                 continue
             context_token = self._token_store.get(self._account_id, chat_id)
             remaining = list(chunks)
@@ -1194,10 +1228,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                                self.name, index + 1, len(pending), _safe_id(chat_id), exc, exc_info=True)
                 # Re-hold from the first chunk this peer has not seen — the ones that went out
                 # must not be re-sent — and keep everything queued behind this reply in order,
-                # under its original deadline.
-                self._hold_outbound_text(chat_id, remaining, enqueued_at=enqueued_at)
-                for queued_at, queued in pending[index + 1:]:
-                    self._hold_outbound_text(chat_id, queued, enqueued_at=queued_at)
+                # each under its own original deadline.
+                self._hold_outbound_text(chat_id, remaining, enqueued_at=enqueued_at, ttl=expires_after)
+                for queued_at, queued, queued_ttl in pending[index + 1:]:
+                    self._hold_outbound_text(chat_id, queued, enqueued_at=queued_at, ttl=queued_ttl)
                 return
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
