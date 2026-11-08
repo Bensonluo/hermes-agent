@@ -254,7 +254,11 @@ class TestEmailConnectClassification:
         assert adapter.fatal_error_retryable is False
 
     @pytest.mark.asyncio
-    async def test_smtp_transient_failure_stays_retryable(self, monkeypatch):
+    async def test_smtp_transient_failure_degrades_send_path(self, monkeypatch):
+        # Receive must not die with the send leg (#151356): a connect-level SMTP
+        # failure keeps IMAP polling, the platform reports connected_degraded
+        # and replies fail per send, instead of the adapter refusing to connect
+        # (which stranded inbound mail for the whole SMTP outage).
         adapter = self._make_adapter(monkeypatch)
         from plugins.platforms.email import adapter as email_adapter
 
@@ -267,10 +271,13 @@ class TestEmailConnectClassification:
 
         monkeypatch.setattr(adapter, "_connect_smtp", _smtp_fail)
         ok = await adapter.connect()
+        adapter._running = False
+        if adapter._poll_task:
+            adapter._poll_task.cancel()
 
-        assert ok is False
-        assert adapter.fatal_error_code == "email_smtp_connect_error"
-        assert adapter.fatal_error_retryable is True
+        assert ok is True
+        assert adapter.send_path_degraded is True
+        assert adapter.has_fatal_error is False
 
 
 # ── Gateway: needs_attention escalation ────────────────────────────────

@@ -492,6 +492,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
+        # SMTP probe failed at connect: IMAP receive keeps running, replies fail per send (#151356).
+        self._smtp_probe_failed = False
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
         # chat_id (sender email) -> last subject + message-id for threading
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
@@ -583,8 +585,26 @@ class EmailAdapter(BasePlatformAdapter):
             return self._fail("[Email] IMAP connection failed: %s", e, "email_imap_connect_error",
                               f"IMAP connection to {self._imap_host}:{self._imap_port} failed: {e}", retryable=True)
 
+    @property
+    def send_path_degraded(self) -> bool:
+        """True while connect() succeeded but the SMTP probe failed (#151356).
+
+        IMAP receive is proven and polling; outbound submission is not, so replies
+        fail per send until SMTP becomes reachable. getattr: tests build adapters
+        via object.__new__().
+        """
+        return bool(getattr(self, "_smtp_probe_failed", False))
+
     def _probe_smtp(self) -> bool:
-        """SMTP connect + login test. Sets a fatal error and returns False on failure."""
+        """SMTP connect + login test; decides whether the platform may come up.
+
+        Typed auth failures never self-heal and stay fatal for the platform. A
+        connect-level failure (filtered port, timeout, DNS) leaves the separately
+        proven IMAP receive path intact, so it degrades the send path only
+        (#151356): connect() proceeds, the poll loop starts, replies fail per
+        send, and the platform reports connected_degraded until a successful
+        reply proves SMTP recovered.
+        """
         try:
             smtp = self._connect_smtp()
             try:
@@ -592,15 +612,18 @@ class EmailAdapter(BasePlatformAdapter):
             finally:
                 smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
+            self._smtp_probe_failed = False
             return True
         except smtplib.SMTPAuthenticationError as e:
             # Typed auth failure (535 & friends) can never self-heal, so drop out of the reconnect queue — unambiguous, unlike IMAP4.error.
+            self._smtp_probe_failed = False  # fatal-down is not send-path-degraded; keep the flag on the last probe outcome
             return self._fail("[Email] SMTP authentication failed: %s", e, "email_auth_error",
                               f"SMTP authentication failed for {self._address}: {e}. Check EMAIL_PASSWORD (for Gmail/Outlook "
                               "this must be an app password, not the account password).", retryable=False)
         except Exception as e:
-            return self._fail("[Email] SMTP connection failed: %s", e, "email_smtp_connect_error",
-                              f"SMTP connection to {self._smtp_host} failed: {e}", retryable=True)
+            self._smtp_probe_failed = True
+            logger.warning("[Email] SMTP connection test failed: %s — receive continues; replies will fail per send until SMTP is reachable", e)
+            return True
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the IMAP server and start polling for new messages."""
@@ -615,7 +638,7 @@ class EmailAdapter(BasePlatformAdapter):
         if self._require_authenticated_sender and not self._authserv_id and self._address not in EmailAdapter._missing_pin_warned:
             EmailAdapter._missing_pin_warned.add(self._address)
             logger.warning("[Email] %s: %s.%s", self._address, _MISSING_AUTHSERV_REASON, _MISSING_AUTHSERV_HINT)
-        self._running = True
+        self._mark_connected()  # publishes connected_degraded while the SMTP probe failed (#151356)
         self._poll_task = asyncio.create_task(self._poll_loop())
         print(f"[Email] Connected as {self._address}")
         self._wire_plugin_handlers(None)  # plugin-registered native handlers
@@ -623,7 +646,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling and disconnect."""
-        self._running = False
+        self._mark_disconnected()
         await cancel_task(self._poll_task)
         self._poll_task = None
         logger.info("[Email] Disconnected.")
@@ -846,10 +869,21 @@ class EmailAdapter(BasePlatformAdapter):
     async def _run_send(self, fn, args: tuple, log_fmt: str, *log_args) -> SendResult:
         """Run a blocking SMTP sender in the executor; wrap its Message-ID in a SendResult."""
         try:
-            return SendResult(success=True, message_id=await asyncio.get_running_loop().run_in_executor(None, fn, *args))
+            message_id = await asyncio.get_running_loop().run_in_executor(None, fn, *args)
         except Exception as e:
             logger.error(log_fmt, *log_args, e)
             return SendResult(success=False, error=str(e))
+        if getattr(self, "_smtp_probe_failed", False):
+            # A delivered reply proves the SMTP leg recovered; shed connected_degraded (#151356).
+            # Guard mirrors Telegram's proof shed: only a running, healthy adapter republishes
+            # "connected" — a reply completing after disconnect() or an IMAP-fatal escalation
+            # must not resurrect the adapter. _write_runtime_status_safe, not _mark_connected,
+            # because the latter would also force _running and clear fatal state.
+            self._smtp_probe_failed = False
+            if getattr(self, "_running", False) and not self.has_fatal_error:
+                self._write_runtime_status_safe(
+                    "connected", platform_state="connected", error_code=None, error_message=None)
+        return SendResult(success=True, message_id=message_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send an email reply to the given address."""

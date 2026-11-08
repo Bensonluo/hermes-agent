@@ -646,6 +646,113 @@ class TestConnectDisconnect(unittest.TestCase):
                 adapter._poll_task.cancel()
 
 
+class TestSmtpProbeDegradation(unittest.TestCase):
+    """An SMTP probe failure must degrade send without killing IMAP receive (#151356)."""
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    @staticmethod
+    def _imap_ok():
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("OK", [b"1 2 3"])
+        return patch("imaplib.IMAP4_SSL", return_value=mock_imap)
+
+    def test_connect_level_smtp_failure_degrades_send_but_starts_polling(self):
+        """A filtered/timed-out SMTP port must not stop IMAP polling (#151356)."""
+        import asyncio
+        adapter = self._make_adapter()
+        with self._imap_ok(), patch.object(adapter, "_connect_smtp", side_effect=OSError("connection timed out")):
+            result = asyncio.run(adapter.connect())
+        try:
+            self.assertTrue(result)
+            self.assertTrue(adapter._running)
+            self.assertIsNotNone(adapter._poll_task)
+            self.assertTrue(adapter.send_path_degraded)
+            self.assertFalse(adapter.has_fatal_error)
+        finally:
+            adapter._running = False
+            if adapter._poll_task:
+                adapter._poll_task.cancel()
+
+    def test_reconnect_with_recovered_smtp_clears_degradation(self):
+        """A reconnect whose SMTP probe passes publishes a healthy platform again."""
+        import asyncio
+        adapter = self._make_adapter()
+        with self._imap_ok(), patch.object(adapter, "_connect_smtp", side_effect=OSError("connection timed out")):
+            self.assertTrue(asyncio.run(adapter.connect()))
+        self.assertTrue(adapter.send_path_degraded)
+        adapter._running = False
+        if adapter._poll_task:
+            adapter._poll_task.cancel()
+            adapter._poll_task = None
+        with self._imap_ok(), patch.object(adapter, "_connect_smtp") as smtp_ok:
+            self.assertTrue(asyncio.run(adapter.connect(is_reconnect=True)))
+        smtp_ok.return_value.login.assert_called_once()
+        self.assertFalse(adapter.send_path_degraded)
+        self.assertFalse(adapter.has_fatal_error)
+        adapter._running = False
+        if adapter._poll_task:
+            adapter._poll_task.cancel()
+
+    def test_successful_reply_sheds_connected_degraded(self):
+        """The first delivered reply after a degraded connect proves SMTP recovered."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._running = True  # the shed only republishes for a running adapter
+        adapter._smtp_probe_failed = True
+        with patch.object(adapter, "_send_email", return_value="<msg@test.com>"):
+            result = asyncio.run(adapter.send("user@test.com", "hello"))
+        self.assertTrue(result.success)
+        self.assertFalse(adapter._smtp_probe_failed)
+        self.assertFalse(adapter.send_path_degraded)
+
+    def test_failed_reply_keeps_degradation(self):
+        """A reply that still fails must not shed connected_degraded."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._smtp_probe_failed = True
+        with patch.object(adapter, "_send_email", side_effect=OSError("still filtered")):
+            result = asyncio.run(adapter.send("user@test.com", "hello"))
+        self.assertFalse(result.success)
+        self.assertTrue(adapter._smtp_probe_failed)
+        self.assertTrue(adapter.send_path_degraded)
+
+    def test_reply_completing_after_disconnect_does_not_resurrect(self):
+        """A send finishing after disconnect() must not republish a dead adapter (#151356)."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._running = False  # disconnected: no poll task
+        adapter._smtp_probe_failed = True
+        with patch.object(adapter, "_send_email", return_value="<msg@test.com>"):
+            result = asyncio.run(adapter.send("user@test.com", "late reply"))
+        self.assertTrue(result.success)
+        self.assertFalse(adapter._running)  # still down — not resurrected as "connected"
+
+    def test_smtp_auth_failure_remains_fatal(self):
+        """Typed auth failures never self-heal, so the platform must not come up."""
+        import asyncio
+        import smtplib
+        adapter = self._make_adapter()
+        with self._imap_ok(), patch.object(adapter, "_connect_smtp",
+                side_effect=smtplib.SMTPAuthenticationError(535, b"Invalid credentials")):
+            result = asyncio.run(adapter.connect())
+        self.assertFalse(result)
+        self.assertEqual(adapter.fatal_error_code, "email_auth_error")
+        self.assertFalse(adapter._running)
+        self.assertIsNone(adapter._poll_task)
+
+
 class TestFetchNewMessages(unittest.TestCase):
     """Test IMAP message fetching logic."""
 
