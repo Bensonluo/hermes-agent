@@ -147,10 +147,9 @@ def test_a_killed_managed_worker_is_disposed_of_within_one_tick(board):
 def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
     """The breaker covers this class: one loss short of the limit, the next loss blocks.
 
-    ``_account_crashes`` books a plain crash against ``DEFAULT_FAILURE_LIMIT`` (the sweep
-    resolves the threshold there rather than against the dispatcher's ``failure_limit``),
-    so the card is seeded one failure short of that limit instead of pinning a threshold
-    this path never reads.
+    ``board.tick()`` passes no explicit ``failure_limit``, so the dispatcher default
+    (``DEFAULT_FAILURE_LIMIT``) is the budget on this path; the card is seeded one
+    failure short of that limit.
     """
     board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
                   worker_lost="managed_worker_failed")
