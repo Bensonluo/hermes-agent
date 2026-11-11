@@ -169,3 +169,28 @@ async def test_command_authority_precedes_resolution_and_mutation(tmp_path, monk
                 'params': {'session_id': 'local-test', **payload}})
             assert result.get('error', {}).get('message') == reason, result
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_non_local_session_refusal_names_the_source_platform(tmp_path):
+    """#153927 — the slash.exec local-source gate refuses a messaging-owned session by name
+    (``RuntimeStoreError.detail``), not with the bare reason a client cannot act on."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from gateway.session_authority import SessionAuthority, LiveSession
+    from gateway.session_controls import AuthorityConnection
+
+    runner = SimpleNamespace(_draining=False)
+    authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='owned', db=None, epoch=1)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='tg-1', user_id='owner')
+    authority.sessions['tg-1'] = LiveSession(source, 'route')
+    connection = AuthorityConnection(authority, object(),
+                                     {'user_id': 'owner', 'capabilities': ['session:read']})
+    try:
+        result = await connection.dispatch({'id': 1, 'method': 'slash.exec',
+                                            'params': {'session_id': 'tg-1', 'command': 'help'}})
+        assert result.get('error', {}).get('message') == 'permission_denied', result
+        detail = result['error']['data'].get('detail', '')
+        assert 'telegram' in detail and 'locally' in detail, result
+    finally:
+        await connection.close()

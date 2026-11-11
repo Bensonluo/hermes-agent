@@ -464,7 +464,13 @@ async def execute_command(connection, ref, params, *, dispatch=False):
         raise read_only()  # no policy or agent to run even a read command against
     from gateway.session_local import authorize_local_source
     if authorize_local_source(authority.runner, live.source) is not True:
-        raise RuntimeStoreError('permission_denied')
+        # Name the check per RuntimeStoreError's contract (a client tells the many checks behind
+        # one reason apart): an attached viewer on a messaging-owned session gets the platform and
+        # the way out, not the bare code (#153927).
+        platform = getattr(getattr(live.source, 'platform', None), 'value', None) or 'not local'
+        raise RuntimeStoreError('permission_denied', detail=(
+            f"this session's source is {platform}; slash commands run on sessions the gateway "
+            "owns locally — run the command in the chat that owns the session"))
     if capability != 'session:read':
         authority._require_admission_open()
     if definition is not None and (canonical in _INFO_READS or canonical in _OWNER_COMMANDS

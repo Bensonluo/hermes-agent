@@ -188,6 +188,12 @@ async def forward(view, name, rest):
         reply = await view.client.rpc("slash.exec", session_id=view.session_id,
                                       command=name + (" " + rest if rest else ""))
     except GatewayRPCError as exc:
+        if str(exc) == "permission_denied" and exc.data.get("detail"):
+            # The owner named its check (RuntimeStoreError.detail: a session the gateway does not
+            # own locally, ...): print where the command stands, as unsupported_command does —
+            # never the bare code (#153927).
+            print(f"/{name} refused: {exc.data['detail']}")
+            return
         if str(exc) != "unsupported_command":
             raise
         from hermes_cli.commands import resolve_command
