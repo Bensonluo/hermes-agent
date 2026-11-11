@@ -357,11 +357,15 @@ def _validate_ollama_native(req: _Request) -> Optional[dict[str, Any]]:
 
 def _validate_custom(req: _Request) -> dict[str, Any]:
     from hermes_cli import models as _m
+    from agent.command_token_source import materialize_probe_api_key
 
-    # Probe with the auth shape the api_mode expects.
+    # Probe with the auth shape the api_mode expects. The switch path hands key_cmd providers
+    # in as a CommandTokenSource; mint it first (picker parity) or /models gets the repr as the
+    # bearer and 401s against a healthy endpoint (#154004).
     anthropic_style = req.api_mode == "anthropic_messages"
     probe_kwargs = {"api_mode": req.api_mode} if anthropic_style else {}
-    probe = _m.probe_api_models(req.api_key, req.base_url, request_headers=req.headers, **probe_kwargs)
+    probe = _m.probe_api_models(
+        materialize_probe_api_key(req.api_key), req.base_url, request_headers=req.headers, **probe_kwargs)
     api_models = probe.get("models")
     if api_models is not None:
         match = _match_in_catalog(req.lookup, api_models, suggest_query=req.requested)
