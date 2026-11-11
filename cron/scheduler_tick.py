@@ -113,9 +113,15 @@ def _tick_admitted(
 
     try:
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
+        from cron.dispatch_hold import note_held  # unconditional sibling; not under the estop suppress
+
         with contextlib.suppress(ImportError):
             from agent.estop import check_paused as _estop_check_paused
             if _estop_check_paused("cron", _sched.logger):
+                # A pause holds dispatch like a drain does: stamp it, so a one-shot due during
+                # the pause (or run by hand just before it) keeps its grace window and fires
+                # once after `hermes resume` instead of being retired as missed (#153683).
+                note_held()
                 return 0
 
         if can_dispatch is not None and not can_dispatch():
