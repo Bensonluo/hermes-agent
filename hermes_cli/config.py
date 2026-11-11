@@ -588,6 +588,7 @@ def ensure_hermes_home():
 from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS
 from hermes_cli import config_provider_env as _config_provider_env
 from hermes_cli.config_provider_env import core_declared_env_names
+from hermes_cli.config_model_flatten import flatten_model_default_dicts
 from hermes_cli.config_providers import (
     _API_MODE_ALIASES, _CAMEL_ALIASES, _KNOWN_PROVIDER_KEYS, _PROVIDER_NORMALIZE_WARNED,
     _canonical_api_mode, _coerce_ssl_verify, _custom_provider_entry_to_provider_config,
@@ -1645,18 +1646,9 @@ def _normalize_root_model_keys(config: dict[str, Any]) -> dict[str, Any]:
     model = dict(model) if isinstance(model, dict) else {"default": model} if model else {}
     config["model"] = model
 
-    # Flatten ``{provider: <p>, model: <m>}``. The nested provider wins over the merged default
-    # ``"auto"`` (which runtime resolution treats as authoritative) but never over a configured one.
-    for _key in ("default", "model", "name"):
-        _val = model.get(_key)
-        if isinstance(_val, dict):
-            _nested_model = _val.get("model") or _val.get("default")
-            _nested_provider = str(_val.get("provider") or "").strip()
-            model[_key] = str(_nested_model or "").strip()
-            if _nested_provider:
-                _outer_provider = str(model.get("provider") or "").strip()
-                if not _outer_provider or _outer_provider == "auto":
-                    model["provider"] = _nested_provider
+    # Flatten ``{provider: <p>, model: <m>}``; unknown nested keys are lifted next to
+    # ``default`` so a whole-file save keeps forward-compatible fields (#153296).
+    flatten_model_default_dicts(model)
 
     for key in ("provider", "base_url", "context_length"):
         root_val = config.get(key)
