@@ -163,6 +163,10 @@ class TestReasoningEchoFamily:
         ("xiaomi", None, "https://x", "mimo"),
         ("custom", "MiMo-7B", "https://x", "mimo"),
         ("custom", None, "https://api.xiaomimimo.com/v1", "mimo"),
+        # Reflection AI (Beam) 400s unless every earlier assistant message carries
+        # reasoning_content, so it joins the must-echo tier (#154304).
+        ("reflection", None, "https://x", "reflection"),
+        ("custom", "Beam-1.0-501B-A23B", "https://api.reflection.ai/openai/v1", "reflection"),
         # Ollama has no echo-back requirement: replayed (as reasoning + reasoning_content) but never padded.
         ("ollama-cloud", "kimi-k3", "https://x", None),
         ("custom", "kimi-k3", "https://ollama.com/v1", None),
@@ -170,6 +174,7 @@ class TestReasoningEchoFamily:
         ("custom", "gpt-oss:120b-cloud", "http://127.0.0.1:11434/v1", None),
         ("gmi", "gmi-cloud", "https://x", None),
         ("custom", "qwen3:8b", "http://127.0.0.1:11434/v1", None),
+        ("custom", "m", "https://reflection.example.com/v1", None),
         ("openai", "gpt-5", "https://api.openai.com/v1", None),
         ("mistral", "mistral-large", "https://api.mistral.ai/v1", None),
         (None, None, None, None),

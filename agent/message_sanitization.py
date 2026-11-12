@@ -666,6 +666,9 @@ _REASONING_ECHO_RULES: tuple = (
     ("kimi", frozenset({"kimi-coding", "kimi-coding-cn"}), frozenset(), (), ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
     ("deepseek", frozenset(), frozenset({"deepseek"}), ("deepseek",), ("api.deepseek.com",)),
     ("mimo", frozenset(), frozenset({"xiaomi"}), ("mimo",), ("api.xiaomimimo.com", "xiaomimimo.com")),
+    # Reflection AI (Beam) 400s when any earlier assistant message lacks reasoning_content
+    # ("needs the reasoning of every earlier assistant message", #154304).
+    ("reflection", frozenset(), frozenset({"reflection"}), (), ("reflection.ai",)),
     # Portal stealth model that 400s on a tool-call turn without reasoning_content (f86276d2ebc).
     ("missingno", frozenset(), frozenset(), ("stealth/missingno",), ()),
 )
@@ -689,6 +692,9 @@ _REASONING_CARRIER_ROUTES: tuple = (
     # Vendors that document reasoning_details replay next to reasoning_content.
     (frozenset({RC, RD}), frozenset({"novita", "tencent-tokenhub", "minimax", "minimax-cn"}),
      ("novita.ai", "tokenhub.tencentmaas.com", "tokenhub-intl.tencentcloudmaas.com", "minimax.io", "minimaxi.com")),
+    # Reflection AI's schema reads reasoning_content only — the `reasoning` alias is an
+    # unrecognized-argument 400 there (#154304). Must precede the `custom` provider row.
+    (frozenset({RC}), frozenset({"reflection"}), ("reflection.ai",)),
     (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "custom", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
 )
 

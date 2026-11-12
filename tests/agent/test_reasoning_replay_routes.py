@@ -66,6 +66,16 @@ def test_must_echo_pads_and_aliased_gemini_keeps_its_signature():
     assert gemini_alias["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "sig"}}
 
 
+def test_reflection_ai_reads_only_reasoning_content_and_pads_the_bare_turn():
+    # #154304: Beam 400s when an earlier assistant message lacks reasoning_content ("needs the
+    # reasoning of every earlier assistant message") and rejects the `reasoning` alias outright
+    # ("Unrecognized request argument supplied: messages[N].reasoning").
+    turn, bare = _wire("custom", "https://api.reflection.ai/openai/v1", "Beam-1.0-501B-A23B")
+    assert turn["reasoning_content"] == "thought"
+    assert "reasoning" not in turn and "reasoning_details" not in turn
+    assert bare["reasoning_content"] == " "
+
+
 class _Rejection(Exception):
     status_code = 400
 
