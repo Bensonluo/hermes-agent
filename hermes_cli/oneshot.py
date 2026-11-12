@@ -86,14 +86,22 @@ _INTERRUPTED_EXIT_CODE = 130
 def _oneshot_exit_code(response: Optional[str], result: dict) -> int:
     """Map a finished ``-z`` turn onto its exit code: ``0`` only when the turn completed;
     ``130`` interrupted; ``2`` failed or stopped partway (``partial``, ``completed: False`` such
-    as the iteration budget); ``1`` a completed turn that produced no text at all.
+    as the iteration budget, or a ``pre_llm_call`` hook veto — the block message is printed but
+    the model never ran, #154234); ``1`` a completed turn that produced no text at all.
 
     The outcome is judged from the result, not from whether text was printed: a partial or
     failed turn usually leaves an explanation on stdout, and exiting 0 for it made scripts treat
     a half-done job (or a provider error summary) as success (#111770).
     """
+    from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON
+
     if result.get("interrupted"):
         return _INTERRUPTED_EXIT_CODE
+    # A pre_llm_call veto means the task was not done, so an unattended caller must not see
+    # success (#154234). Chat surfaces still deliver the block message as the turn's answer —
+    # ``failed``/``completed`` keep their values — so only the exit status carries the verdict.
+    if str(result.get("turn_exit_reason") or "") == PRE_LLM_BLOCK_EXIT_REASON:
+        return 2
     if result.get("failed") or result.get("partial") or result.get("completed") is False:
         return 2
     if not (response or "").strip():

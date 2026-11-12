@@ -90,6 +90,12 @@ def test_blocked_turn_never_reaches_the_provider_and_stores_only_the_placeholder
         assert result["final_response"] == BLOCK_MSG
         assert result["turn_exit_reason"] == PRE_LLM_BLOCK_EXIT_REASON
         assert result["api_calls"] == 0 and result["failed"] is False
+        # The veto keeps failed/completed as-is (the block message is the turn's answer), so the
+        # one-shot exit contract — not the result verdict — is what tells unattended callers the
+        # model never ran (#154234).
+        from hermes_cli.oneshot import _oneshot_exit_code
+
+        assert _oneshot_exit_code(result["final_response"], result) == 2
 
         history = db.get_messages_as_conversation("s-block")
         assert [(m["role"], m["content"]) for m in history] == [
