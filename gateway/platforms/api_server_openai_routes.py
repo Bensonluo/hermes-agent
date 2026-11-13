@@ -733,6 +733,22 @@ def _parse_chat_messages(messages: list[Any]) -> tuple:
     return system_prompt, conversation_messages, None
 
 
+def _strip_trailing_empty_assistant(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Pop trailing assistant messages that carry no visible payload, in place.
+
+    #154758: OpenAI-compatible clients that pre-allocate the reply slot (Open WebUI)
+    append a trailing empty ``assistant`` message; the last real user message below it
+    is the turn input.  A trailing assistant message WITH payload (assistant prefill)
+    keeps today's semantics.
+    """
+    from gateway.platforms.api_server import _content_has_visible_payload
+    while (messages
+           and messages[-1]["role"] == "assistant"
+           and not _content_has_visible_payload(messages[-1].get("content", ""))):
+        messages.pop()
+    return messages
+
+
 def _parse_responses_input(raw_input: Any) -> tuple:
     """Responses ``input`` (string or item array) -> ``(input_messages, error_response_or_None)``."""
     from gateway.platforms.api_server import (
@@ -886,6 +902,7 @@ class OpenAICompatRoutesMixin:
         system_prompt, conversation_messages, messages_err = _parse_chat_messages(messages)
         if messages_err is not None:
             return messages_err
+        conversation_messages = _strip_trailing_empty_assistant(conversation_messages)
         user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
         history = conversation_messages[:-1]
         if not _content_has_visible_payload(user_message):
