@@ -429,6 +429,70 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
     assert response.status_code == 403
 
 
+def test_fs_download_responses_are_never_served_from_a_cache(client, tmp_path):
+    """A MEDIA card link re-clicked after the file was overwritten in place must read current
+    bytes: without a freshness policy a shared cache between a remote client and the gateway may
+    answer the re-download from its first copy of the URL (#155031)."""
+    target = tmp_path / "installer.sh"
+    target.write_bytes(b"build 1")
+
+    first = client.get("/api/fs/download", params={"path": str(target)})
+    target.write_bytes(b"build 2")
+    second = client.get("/api/fs/download", params={"path": str(target)})
+    head = client.head("/api/fs/download", params={"path": str(target)})
+
+    assert (first.status_code, first.content) == (200, b"build 1")
+    assert (second.status_code, second.content) == (200, b"build 2")
+    assert head.status_code == 200
+    for response in (first, second, head):
+        assert response.headers.get("cache-control") == "no-store"
+
+
+def test_an_ssh_workspace_download_is_never_served_from_a_cache(client, monkeypatch, tmp_path):
+    """The SSH branch of the download route carries the same policy: its bytes come from the
+    remote machine, and an in-place overwrite there must reach the re-clicked download too."""
+    remote = tmp_path / "srv" / "report.txt"
+
+    class FakeSshFs:
+        def inspect_file(self, path):
+            return path, len(b"remote copy")
+
+        def stream_file(self, path):
+            yield b"remote copy"
+
+    monkeypatch.setattr(file_routes, "_fs_backend", lambda profile=None: FakeSshFs())
+
+    direct = client.get("/api/fs/download", params={"path": str(remote)})
+    head = client.head("/api/fs/download", params={"path": str(remote)})
+
+    assert (direct.status_code, direct.content) == (200, b"remote copy")
+    assert (head.status_code, head.content) == (200, b"")
+    for response in (direct, head):
+        assert response.headers.get("cache-control") == "no-store"
+
+
+def test_a_ticketed_download_of_a_host_file_is_never_served_from_a_cache(client, monkeypatch, tmp_path):
+    """The ticketed local branch (``OpenedFileResponse``) serves a browser download link like any
+    other: the anchor URL it authorizes goes through shared caches, so it is no-store as well."""
+    monkeypatch.setattr(web_server.app.state, "ui_surface", "webapp", raising=False)
+    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
+    monkeypatch.setattr(file_routes, "_fs_backend", lambda profile=None: None)
+    target = tmp_path / "report.pdf"
+    target.write_bytes(b"pdf bytes")
+    query = {"route": "download", "path": str(target)}
+
+    minted = client.post("/api/files/ticket", json=query)
+    assert minted.status_code == 200, minted.text
+    anchor = TestClient(web_server.app)  # a download link sends no session header
+    try:
+        saved = anchor.get("/api/fs/download", params={"path": str(target), "ticket": minted.json()["ticket"]})
+    finally:
+        anchor.close()
+
+    assert (saved.status_code, saved.content) == (200, b"pdf bytes")
+    assert saved.headers.get("cache-control") == "no-store"
+
+
 @pytest.mark.platforms("windows")
 @pytest.mark.parametrize("endpoint", ["/api/fs/download", "/api/fs/read-data-url"])
 @pytest.mark.parametrize("prefix", ["/", "/cygdrive/", "/mnt/"])

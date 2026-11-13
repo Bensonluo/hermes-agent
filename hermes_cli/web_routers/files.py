@@ -1351,7 +1351,12 @@ def _remote_download_response(request: Optional[Request], backend, target: str, 
     """*target* streamed from the SSH workspace as an attachment; a HEAD reads none of it."""
     target_path = Path(target)
     filename = urllib.parse.quote(target_path.name)
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    # no-store: a link re-clicked after an in-place overwrite must read the file's current
+    # bytes, never a shared cache's first copy of the URL (the ticket route's policy).
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+        "Cache-Control": "no-store",
+    }
     media_type = _fs_mime_type(target_path)
     if request is not None and request.method == "HEAD":
         return Response(media_type=media_type, headers={**headers, "Content-Length": str(size)})
@@ -1406,6 +1411,7 @@ async def _ticketed_fs_download(
         media_type=_fs_mime_type(authority.target),
         filename=authority.target.name,
         content_disposition_type="attachment",
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -1415,7 +1421,9 @@ async def fs_download(
     path: str, request: Request = None, profile: Optional[str] = None, session_id: Optional[str] = None,
 ):
     """A workspace file as an attachment: from the profile's SSH workspace when it has one, else
-    from this host. A browser download link authenticates with a path-bound ``?ticket=``."""
+    from this host. A browser download link authenticates with a path-bound ``?ticket=``.
+    Every response is ``no-store``: a link re-clicked after an in-place overwrite must read the
+    file's current bytes, not a shared cache's first copy of the URL."""
     session = await _fs_owned_session(session_id, profile)
     authority = getattr(getattr(request, "state", None), "file_ticket_authority", None)
     if authority is not None:
@@ -1433,6 +1441,7 @@ async def fs_download(
         media_type=_fs_mime_type(target),
         filename=target.name,
         content_disposition_type="attachment",
+        headers={"Cache-Control": "no-store"},
     )
 
 
