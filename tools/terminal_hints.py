@@ -110,6 +110,18 @@ _READONLY_HEADS = frozenset({
     "grep", "rg", "ag", "find", "ls", "cat", "head", "tail", "jq", "awk",
     "sed", "strings", "zcat", "journalctl", "dmesg", "echo", "printf"})
 
+# Heads whose first-stage status is informational, not an error: diff/cmp/test
+# exit 1 on a legitimate finding/condition, the grep family on "no matches". A
+# pipeline headed by one of these exiting 0 is a real success.
+_INFORMATIONAL_HEADS = frozenset({
+    "egrep", "fgrep", "ack", "diff", "colordiff", "cmp", "test", "["})
+
+# A producer dying of SIGPIPE (141) once the consumer stops reading (`yes | head`)
+# is the pipeline working as designed, not a masked failure. curl maps the same
+# event to its own write-error code 23 instead of taking the signal.
+_SIGPIPE_EXIT = 141
+_CURL_WRITE_ERROR = 23
+
 # Strong failure shapes keyed to specific tools so that error-mentioning
 # *content* (diffs, logs, commit messages) rarely matches.
 _FAILURE_SHAPES = re.compile(
@@ -136,9 +148,44 @@ def _first_token(command: str) -> str:
     return ""
 
 
-def annotate_masked_success(command: str, output: str) -> Optional[str]:
+def _pipeline_stage_note(command: str, pipeline_status: Optional[list[int]]) -> Optional[str]:
+    """Direct PIPESTATUS evidence: the last pipeline's first stage failed while the
+    shell's own ``$?`` (the last stage's status, reported as ``exit_code``) is 0.
+    Unlike the output-shape scan this needs no failure text in the output — a stage
+    that fails silently (``exit 7`` printing nothing) is still caught. The array
+    holds only the LAST pipeline's stages, so earlier pipelines inside a compound
+    command are outside this evidence. Advisory only, like the shape-based note:
+    exit_code is never changed."""
+    if not pipeline_status or len(pipeline_status) < 2:
+        # One status = the last command was not a pipeline (compound shapes collapse it).
+        return None
+    first = pipeline_status[0]
+    if first == 0:
+        return None
+    cmd = command.lstrip()
+    if cmd.startswith("!"):
+        # `! cmd | tail` inverts the pipeline status on purpose: a first-stage
+        # failure is the expected outcome, not a masked one.
+        return None
+    head = _first_token(command)
+    if first == _SIGPIPE_EXIT or (first == _CURL_WRITE_ERROR and head == "curl"):
+        # Producer stopped early because the consumer stopped reading.
+        return None
+    if head in _READONLY_HEADS | _INFORMATIONAL_HEADS:
+        return None
+    return (
+        f"exit_code 0 here is the last pipeline stage's status; the shell's PIPESTATUS "
+        f"shows the first stage exited {first} — a masked failure. Treat this run as "
+        "FAILED until proven otherwise: re-run the command WITHOUT the pipe (output is "
+        "auto-truncated, so piping through tail/head is never needed) to get the real exit code.")
+
+
+def annotate_masked_success(command: str, output: str,
+                            pipeline_status: Optional[list[int]] = None) -> Optional[str]:
     """Warning note when an exit-0 result likely masks a failure (caller gates on exit 0)."""
     cmd = command or ""
+    if (pipestatus_note := _pipeline_stage_note(cmd, pipeline_status)) is not None:
+        return pipestatus_note
     window = (output or "")[:_SCAN_CHARS]
     if (not cmd or not window or _first_token(cmd) in _READONLY_HEADS
             or not _FAILURE_SHAPES.search(window)):

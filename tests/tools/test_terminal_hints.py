@@ -215,3 +215,64 @@ class TestMaskedSuccess:
             )
             is None
         )
+
+
+class TestMaskedSuccessPipestatus:
+    """annotate_masked_success with PIPESTATUS evidence: a silently failing first
+    pipeline stage is flagged even when the output carries no failure text."""
+
+    def test_silent_first_stage_failure_flagged(self):
+        # The issue's regression shape: exit 7 with no output at all.
+        hint = annotate_masked_success(
+            'python3 -c "import sys; sys.exit(7)" 2>&1 | tail -25', "", [7, 0])
+        assert hint is not None
+        assert "PIPESTATUS" in hint and "7" in hint
+
+    def test_issue_corpus_shape_flagged(self):
+        # `python3 -m pytest` with pytest missing exits 1 printing one line that
+        # matches no _FAILURE_SHAPES pattern — only PIPESTATUS catches it.
+        hint = annotate_masked_success(
+            "python3 -m pytest -q tests/ 2>&1 | tail -25", "", [1, 0])
+        assert hint is not None
+
+    def test_all_zero_statuses_not_flagged(self):
+        assert annotate_masked_success("pytest tests/ | tail -5", "ok\n", [0, 0]) is None
+
+    def test_single_status_not_flagged(self):
+        # A one-element PIPESTATUS means the last command was not a pipeline
+        # (a trailing `; echo done` collapses the array to echo's own status).
+        assert annotate_masked_success("echo done", "", [0]) is None
+        assert annotate_masked_success("false | cat; echo done", "done\n", [0]) is None
+
+    def test_sigpipe_producer_not_flagged(self):
+        # `yes | head` — producer killed by SIGPIPE once head stops reading.
+        assert annotate_masked_success("yes | head -1", "y\n", [141, 0]) is None
+
+    def test_curl_write_error_not_flagged(self):
+        # curl maps "consumer stopped reading" to its own write-error 23
+        # (`curl URL | head -c 500`) instead of dying of SIGPIPE.
+        assert annotate_masked_success(
+            "curl -fsSL https://example.com | head -c 500", "y\n", [23, 0]) is None
+
+    def test_negated_pipeline_not_flagged(self):
+        # `! cmd | tail` expects the first stage to fail — that is the assertion.
+        assert annotate_masked_success("! pytest tests/ | tail -5", "", [1, 0]) is None
+
+    def test_informational_heads_not_flagged(self):
+        # diff/cmp exit 1 = files differ; grep-family exit 1 = no matches.
+        assert annotate_masked_success("diff a.txt b.txt | tail -5", "", [1, 0]) is None
+        assert annotate_masked_success("cmp a.txt b.txt | tail -5", "", [1, 0]) is None
+        assert annotate_masked_success("egrep foo bar.txt | head -3", "", [1, 0]) is None
+
+    def test_pipestatus_takes_priority_over_output_shape(self):
+        # Direct evidence outranks the output heuristic; both would fire here.
+        hint = annotate_masked_success(
+            "cargo build 2>&1 | tail -20", "error: could not compile `x`\n", [101, 0])
+        assert hint is not None
+        assert "PIPESTATUS" in hint
+
+    def test_none_pipestatus_keeps_output_shape_behavior(self):
+        assert annotate_masked_success(
+            "cargo build 2>&1 | tail -20", "error[E0308]: x\n") is not None
+        assert annotate_masked_success(
+            "cargo build 2>&1 | tail -20", "   Finished release\n") is None
