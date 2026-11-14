@@ -6,6 +6,7 @@ from datetime import datetime, timezone, UTC
 
 import pytest
 
+from agent import account_usage
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
@@ -340,3 +341,31 @@ def test_fetch_portal_account_returns_value_and_keeps_caller_context(monkeypatch
     finally:
         marker.reset(token)
     assert seen == {"force_fresh": True, "marker": "profile-scope"}
+
+
+def test_anthropic_oauth_usage_fetch_sends_detected_claude_code_version(monkeypatch):
+    """The OAuth usage fetch carries the detected Claude Code version, not a pinned literal.
+
+    Anthropic gates OAuth requests on the claude-code version in the User-Agent; the fetch
+    pinned ``claude-code/2.1.0``, which ages into ``claude_code_version_too_old`` 400s while
+    the inference OAuth path already sends the detected version (#155867). Both paths must
+    report the same version so a detection/fallback fix covers them together.
+    """
+    import agent.anthropic_adapter as adapter
+
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-oat01-testtoken")
+    captured: dict = {}
+
+    def fake_get_json(url, headers, *, timeout):
+        captured["url"] = url
+        captured["headers"] = dict(headers)
+        return {"extra_usage": {}}
+
+    monkeypatch.setattr(account_usage, "_get_json", fake_get_json)
+    monkeypatch.setattr(adapter, "_get_claude_code_version", lambda: "9.9.901")
+
+    snapshot = account_usage._fetch_anthropic_account_usage()
+
+    assert captured["url"] == "https://api.anthropic.com/api/oauth/usage"
+    assert captured["headers"]["User-Agent"] == "claude-code/9.9.901"
+    assert snapshot.provider == "anthropic"

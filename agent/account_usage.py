@@ -855,8 +855,13 @@ def _fetch_anthropic_account_usage(
     if not _is_oauth_token(token):
         return _snapshot("anthropic", "oauth_usage_api", [], [],
                          unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.")
+    # Anthropic gates OAuth requests on the Claude Code version in the User-Agent; a pinned
+    # literal ages into ``claude_code_version_too_old`` 400s (#155867). Send the same detected
+    # version the inference OAuth path sends (anthropic_adapter) so both move together.
+    from agent.anthropic_adapter import _get_claude_code_version
+
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json",
-               "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"}
+               "anthropic-beta": "oauth-2025-04-20", "User-Agent": f"claude-code/{_get_claude_code_version()}"}
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
