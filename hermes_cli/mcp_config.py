@@ -552,7 +552,11 @@ def _configure_http_auth(
         oauth_ok = False
         try:
             from tools.mcp_oauth_manager import get_manager
-            if get_manager().get_or_build_provider(name, url, server_config.get("oauth")):
+            # Resolved (env-expanded) headers: an identity-aware proxy in front of the server guards
+            # the OAuth endpoints on the same origin too, so the provider needs them (#155708).
+            resolved_headers = _resolve_mcp_server_config(server_config).get("headers") or None
+            if get_manager().get_or_build_provider(name, url, server_config.get("oauth"),
+                                                   server_headers=resolved_headers):
                 server_config["auth"] = "oauth"
                 _success("OAuth configured (tokens will be acquired on first connection)")
                 oauth_ok = True
@@ -947,7 +951,10 @@ def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = N
 
         if selected_flow == "device":
             from tools.mcp_oauth_device import login_device
-            asyncio.run(login_device(name, url, oauth_cfg))
+            # Device flow builds its own requests; give it the resolved configured headers so a
+            # proxy in front of the server stops 302-ing discovery/registration (#155708).
+            device_headers = _resolve_mcp_server_config(server_config).get("headers") or None
+            asyncio.run(login_device(name, url, oauth_cfg, server_headers=device_headers))
         probe_config = {**server_config, "oauth": {**oauth_cfg, "flow": selected_flow}}
         with force_interactive_oauth():
             tools = _probe_single_server(

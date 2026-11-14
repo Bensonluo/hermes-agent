@@ -150,11 +150,14 @@ async def test_device_flow_normalizes_issuer_and_asks_google_for_offline_access(
             return httpx.Response(200, json=doc, request=request)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            # _device_metadata takes the provider (reads context.server_url; no configured
+            # headers on this stub — the same-origin scoping has its own test file).
+            resource_provider = SimpleNamespace(context=SimpleNamespace(server_url=RESOURCE))
             if accepted:
-                assert isinstance(await _device_metadata(client, RESOURCE, advertised), DeviceOAuthMetadata)
+                assert isinstance(await _device_metadata(client, resource_provider, advertised), DeviceOAuthMetadata)
             else:
                 with pytest.raises(OAuthFlowError):
-                    await _device_metadata(client, RESOURCE, advertised)
+                    await _device_metadata(client, resource_provider, advertised)
 
     # Device authorization request: Google's carries access_type=offline, any other issuer's does not.
     for issuer, expects_offline in ((GOOGLE, True), (OTHER_AS, False)):

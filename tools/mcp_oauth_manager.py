@@ -35,6 +35,7 @@ class _ProviderEntry:
 
     server_url: str
     oauth_config: Optional[dict]
+    server_headers: Optional[dict] = None
     provider: Optional[Any] = None
     last_mtime_ns: int = 0
     last_version: tuple = ()
@@ -111,12 +112,15 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             build_oauth_authorization_server_metadata_discovery_urls,
             build_protected_resource_metadata_discovery_urls, create_oauth_metadata_request,
             handle_auth_metadata_response, handle_protected_resource_response)
-        from tools.mcp_oauth_provider import stamp_default_user_agent
+        from tools.mcp_oauth_provider import stamp_configured_origin_headers, stamp_default_user_agent
         server_url = self.context.server_url
 
         async def _send(client, url: str, label: str):
             try:
-                return await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)))
+                request = stamp_default_user_agent(create_oauth_metadata_request(url))
+                stamp_configured_origin_headers(
+                    request, server_url, getattr(self, "_hermes_origin_headers", None))
+                return await client.send(request)
             except httpx.HTTPError as exc:
                 logger.debug("MCP OAuth '%s': %s discovery to %s failed: %s", self._hermes_server_name, label, url, exc)
                 return None
@@ -318,17 +322,25 @@ class MCPOAuthManager:
         # Strong refs to in-flight 401 tasks so the loop's weak bookkeeping cannot GC them mid-run.
         self._inflight_tasks: set[asyncio.Task] = set()
 
-    def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
-        """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
-        None if the MCP SDK's OAuth support is unavailable."""
+    def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict],
+                              server_headers: Optional[dict] = None) -> Optional[Any]:
+        """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url``
+        changes); None if the MCP SDK's OAuth support is unavailable. ``server_headers`` are the
+        server's configured ``headers:`` — stored on the entry and stamped onto same-origin OAuth
+        requests (#155708); a later value change rebuilds the provider like a URL change does."""
         key = self._key(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
                 logger.info("MCP OAuth '%s': URL changed from %s to %s, discarding cache", server_name, entry.server_url, server_url)
                 entry = None
+            if entry is not None and (entry.server_headers or None) != (server_headers or None):
+                logger.info("MCP OAuth '%s': configured headers changed, discarding cached provider", server_name)
+                entry = None
             if entry is None:
-                entry = self._entries[key] = _ProviderEntry(server_url=server_url, oauth_config=oauth_config)
+                entry = self._entries[key] = _ProviderEntry(
+                    server_url=server_url, oauth_config=oauth_config,
+                    server_headers=dict(server_headers) if server_headers else None)
             if entry.provider is None:
                 entry.provider = self._build_provider(server_name, entry)
                 if entry.provider is not None:
@@ -358,6 +370,7 @@ class MCPOAuthManager:
                 f"Run `hermes mcp login {server_name}` interactively first to complete initial authorization.")
         return _HERMES_PROVIDER_CLS(
             server_name=server_name, preregistered=bool(cfg.get("client_id")), server_url=entry.server_url,
+            origin_headers=entry.server_headers,
             **build_provider_kwargs(cfg, storage, ssh_proxy_hint=False))
 
     def remove(self, server_name: str, *, hermes_home: str | Path | None = None) -> _ProviderEntry | None:

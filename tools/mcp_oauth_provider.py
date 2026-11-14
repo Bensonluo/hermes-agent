@@ -51,6 +51,70 @@ def stamp_default_user_agent(request):
     return request
 
 
+# Configured server headers that must never ride an OAuth request: ``Authorization`` is the OAuth
+# credential itself (the SDK sets it from tokens), ``Content-Type``/``Host``/``Content-Length``/
+# ``Transfer-Encoding`` belong to the SDK's request framing, ``Cookie`` is ambient browser state,
+# the ``mcp-*`` names are per-session MCP protocol state, and the rest are RFC 9110 §7.6.1
+# hop-by-hop/framing names (incl. ``Proxy-Authorization``, itself a credential).
+OAUTH_FORWARD_DENYLIST = frozenset({
+    "authorization", "content-type", "content-length", "host", "connection", "cookie",
+    "transfer-encoding", "mcp-session-id", "mcp-protocol-version",
+    "keep-alive", "proxy-authorization", "proxy-authenticate", "te", "trailer", "upgrade", "expect",
+})
+
+
+def _url_origin(url) -> tuple[str, str, int | None] | None:
+    """(scheme, host, default-normalized port) of *url* — the origin identity headers are bound
+    to. ``None`` when the URL is too malformed to have an origin: a non-numeric or out-of-range
+    port or a broken IPv6 literal raises out of ``urlsplit(...).port``, and the URLs stamped here
+    can come from server-advertised metadata — a scoping helper must never be the component that
+    raises, so a URL without an origin simply scopes to nothing."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url))
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if not scheme or not host:
+        return None  # relative or hostless: not an origin
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return (scheme, host, port)
+
+
+def origin_scoped_headers(target_url, server_url, headers) -> dict:
+    """The server's configured ``mcp_servers.<name>.headers`` narrowed to a same-origin target.
+
+    Those headers ride every MCP request, but an identity-aware proxy in front of the server
+    (Cloudflare Access service tokens, API-gateway keys) also guards the OAuth endpoints on the
+    same origin: discovery, dynamic client registration, token exchange and refresh. The SDK
+    builds those as bare ``httpx.Request`` objects sent with ``client.send()``, which never merges
+    the client's default headers, so the tokens never reached them and login behind such a proxy
+    was 302'd before the browser even opened (#155708). Scope them to requests whose origin is
+    the MCP server's own: a third-party authorization server must never see the server's proxy
+    credentials, the same boundary ``strict_redirect_headers`` enforces on the transport path.
+    """
+    target_origin = _url_origin(target_url)
+    if (not headers or target_origin is None
+            or target_origin != _url_origin(server_url)):
+        return {}
+    return {name: value for name, value in headers.items()
+            if str(name).lower() not in OAUTH_FORWARD_DENYLIST}
+
+
+def stamp_configured_origin_headers(request, server_url, headers):
+    """Fill in the server's configured headers on an SDK-built OAuth request (never overwrite:
+    a header the SDK already set — its Authorization, Content-Type — keeps its value)."""
+    existing = {str(name).lower() for name in request.headers.keys()}
+    for name, value in origin_scoped_headers(request.url, server_url, headers).items():
+        if str(name).lower() not in existing:
+            request.headers[name] = value
+    return request
+
+
 def _asm_discovery_failure(response) -> str | None:
     """``"<status> from <url>"`` when *response* is a failed authorization-server metadata fetch."""
     req = getattr(response, "request", None)
@@ -83,16 +147,23 @@ class HermesProviderMixin:
       (some authorization servers/WAFs reject httpx's default); unset falls back to the shared
       ``Hermes-Agent/<version>`` default, since a header-less token POST is 403'd by WAF-fronted
       authorization servers (#115329).
-    - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
+    - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs.
+    - ``origin_headers`` (the server's configured ``headers:``) are stamped onto OAuth requests that
+      stay on the server's own origin (#155708) — Cloudflare Access service tokens must reach
+      discovery/registration/token endpoints too, but never a third-party authorization server."""
 
     _hermes_logger: logging.Logger = logger
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
+    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser",
+                 origin_headers: dict | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._hermes_oauth_flow = oauth_flow
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+        # mcp_servers.<name>.headers — forwarded onto same-origin OAuth requests only (#155708);
+        # copied so a later in-place edit of the caller's config dict cannot leak in mid-flow.
+        self._hermes_origin_headers = dict(origin_headers) if origin_headers else None
 
     async def _perform_authorization(self):
         info = self.context.client_info
@@ -271,6 +342,9 @@ class HermesProviderMixin:
                         raise
                     if out is not request:
                         stamp_default_user_agent(out)
+                        stamp_configured_origin_headers(
+                            out, getattr(self.context, "server_url", ""),
+                            getattr(self, "_hermes_origin_headers", None))
                     # Full bidirectional delegation: the SDK drives this flow with
                     # asend(response), so `async for` would swallow the response and
                     # feed the inner generator None. Async generators have no

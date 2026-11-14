@@ -532,12 +532,17 @@ class MCPServerTransportMixin:
 
     def _build_oauth_auth(self, url: str, config: dict):
         """OAuth 2.1 PKCE via the central MCPOAuthManager (one provider reused across reconnects and
-        CLI paths). Setup failures re-raise (after a warning) so only this server is reported failed."""
+        CLI paths). Setup failures re-raise (after a warning) so only this server is reported failed.
+        The configured ``headers`` (already env-resolved on this path) are stamped onto same-origin
+        OAuth requests too (#155708) — the connect-time dict is deliberately NOT passed: it carries
+        the identity overlay and the mcp-protocol-version seed, which would make the CLI- and
+        transport-built entries compare unequal and thrash the provider cache."""
         if self._auth_type != "oauth":
             return None
         try:
             from tools.mcp_oauth_manager import get_manager
-            return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
+            return get_manager().get_or_build_provider(
+                self.name, url, config.get("oauth"), server_headers=config.get("headers") or None)
         except Exception as exc:
             logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
             raise

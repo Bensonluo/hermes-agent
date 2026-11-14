@@ -30,11 +30,11 @@ async def _discover(client, provider):
         handle_protected_resource_response,
     )
     context = provider.context
-    response = await client.get(context.server_url)
+    response = await client.get(context.server_url, headers=_origin_headers(provider, context.server_url))
     challenge = extract_resource_metadata_from_www_auth(response)
     prm = None
     for url in build_protected_resource_metadata_discovery_urls(challenge, context.server_url):
-        response = await client.get(url)
+        response = await client.get(url, headers=_origin_headers(provider, url))
         prm = await handle_protected_resource_response(response)
         if prm:
             await provider._validate_resource_match(prm)
@@ -46,7 +46,7 @@ async def _discover(client, provider):
     failures = []
     for auth_server_url in servers:
         try:
-            metadata = await _device_metadata(client, context.server_url, auth_server_url)
+            metadata = await _device_metadata(client, provider, auth_server_url)
         except (RuntimeError, OAuthFlowError, ValueError) as exc:
             failures.append((auth_server_url, exc))
             continue
@@ -59,14 +59,15 @@ async def _discover(client, provider):
                        + "; ".join(f"{url}: {exc}" for url, exc in failures))
 
 
-async def _device_metadata(client, server_url, auth_server_url):
+async def _device_metadata(client, provider, auth_server_url):
     """Issuer-bound device metadata of one authorization server; raises when it is unusable."""
     from mcp.client.auth.utils import build_oauth_authorization_server_metadata_discovery_urls
 
     from tools.mcp_oauth_provider import metadata_issued_by_origin
 
+    server_url = provider.context.server_url
     for url in build_oauth_authorization_server_metadata_discovery_urls(auth_server_url, server_url):
-        response = await client.get(url)
+        response = await client.get(url, headers=_origin_headers(provider, url))
         if response.status_code == 404:
             continue
         data = _payload(response, "OAuth metadata")
@@ -119,7 +120,7 @@ async def _register(client, provider, cfg):
         endpoint = context.oauth_metadata.registration_endpoint
         if not endpoint:
             raise RuntimeError("Server has no registration endpoint; configure oauth.client_id (and client_secret if required)")
-        response = await client.post(str(endpoint), json=metadata)
+        response = await client.post(str(endpoint), json=metadata, headers=_origin_headers(provider, endpoint))
         data = _payload(response, "Client registration")
     # SEP-2352: bind the credentials to the identifier the SDK's runtime flow compares them against — the
     # advertised authorization server when the resource advertised one, else the metadata issuer (its Step 4
@@ -142,7 +143,7 @@ def _positive_seconds(value, label):
 
 
 async def _authorize(client, provider, cfg):
-    from tools.mcp_oauth_provider import google_offline_access_params
+    from tools.mcp_oauth_provider import google_offline_access_params, stamp_configured_origin_headers
     from tools.mcp_tool import sdk_httpx
 
     context = provider.context
@@ -152,7 +153,11 @@ async def _authorize(client, provider, cfg):
         data["scope"] = context.client_metadata.scope
     data.update(google_offline_access_params(context))
     data, headers = context.prepare_token_auth(data, {})
-    response = await client.post(str(context.oauth_metadata.device_authorization_endpoint), data=data, headers=headers)
+    device_endpoint = str(context.oauth_metadata.device_authorization_endpoint)
+    # Configured same-origin headers ride along, but the SDK's token-auth headers win (#155708).
+    merged = dict(_origin_headers(provider, device_endpoint) or {})
+    merged.update(headers)
+    response = await client.post(device_endpoint, data=data, headers=merged)
     authorization = _payload(response, "Device authorization")
     for key in ("device_code", "user_code", "verification_uri"):
         if not isinstance(authorization.get(key), str) or not authorization[key]:
@@ -174,6 +179,8 @@ async def _authorize(client, provider, cfg):
         await asyncio.sleep(interval)
         request = provider._prepare_token_request(httpx.Request("POST", str(context.oauth_metadata.token_endpoint),
                                                                data=token_data, headers=headers))
+        stamp_configured_origin_headers(request, context.server_url,
+                                        getattr(provider, "_hermes_origin_headers", None))
         try:
             response = await asyncio.wait_for(client.send(request), timeout=deadline - time.monotonic())
         except (TimeoutError, httpx.TimeoutException):
@@ -201,7 +208,19 @@ async def _authorize(client, provider, cfg):
         raise RuntimeError(f"Device authorization failed: {safe_error}")
 
 
-async def login_device(name, server_url, oauth_config):
+def _origin_headers(provider, url):
+    """The server's configured headers when *url* is on the server's own origin, else ``None``.
+
+    The device flow sends its discovery, registration, authorization and token requests through a
+    bare client, so the provider's same-origin stamp (#155708) has to be applied per call here.
+    """
+    from tools.mcp_oauth_provider import origin_scoped_headers
+
+    return origin_scoped_headers(url, provider.context.server_url,
+                                 getattr(provider, "_hermes_origin_headers", None)) or None
+
+
+async def login_device(name, server_url, oauth_config, server_headers=None):
     """Authorize then commit state in the active profile; failed grants preserve old state."""
     from tools.mcp_oauth import _build_client_metadata
     from tools.mcp_oauth_manager import HermesMCPOAuthProvider, get_manager
@@ -213,7 +232,8 @@ async def login_device(name, server_url, oauth_config):
     cfg["_resolved_port"] = cfg.get("redirect_port", 8420)
     provider = HermesMCPOAuthProvider(server_url=server_url, server_name=name, storage=storage,
                                      client_metadata=_build_client_metadata(cfg),
-                                     token_user_agent=cfg.get("user_agent"))
+                                     token_user_agent=cfg.get("user_agent"),
+                                     origin_headers=server_headers)
     httpx = sdk_httpx()
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
