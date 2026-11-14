@@ -378,16 +378,42 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
-def _strip_markdown_syntax(text: str) -> str:
-    """Best-effort markdown marker removal for plain-text display."""
-    from cli import _rich_text_from_ansi
-    plain = _rich_text_from_ansi(text or "").plain
-    # HR markers: "-"/"_" runs of 3+, but "*" only when exactly 3 (cron schedules "* * * * *").
+_CODE_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _code_fence_marker(line: str) -> tuple[str, int, str] | None:
+    """Classify a line as a CommonMark code-fence delimiter candidate.
+
+    Returns ``(fence_char, marker_length, rest_of_line)`` when the line starts
+    (after up to three spaces) with a run of at least three backticks or
+    tildes, else ``None``. Callers combine this with their fence state via
+    :func:`_closes_code_fence`; a backtick fence may not open when its info
+    string contains a backtick.
+    """
+    m = _CODE_FENCE_LINE_RE.match(line)
+    if not m:
+        return None
+    return m.group(1)[0], len(m.group(1)), m.group(2)
+
+
+def _closes_code_fence(marker: tuple[str, int, str] | None, fence_char: str, fence_len: int) -> bool:
+    """True when ``marker`` is a valid closing delimiter for the open fence.
+
+    A closing fence must reuse the opening character, be at least as long, and
+    carry nothing but whitespace after the marker.
+    """
+    return bool(marker and marker[0] == fence_char and marker[1] >= fence_len
+                and not marker[2].strip())
+
+
+def _strip_prose_markdown(segment: str) -> str:
+    """Marker removal for a prose segment; code fences are split out upstream."""
+    plain = segment
+    # HR markers: "-" or "_" runs of 3+, but "*" only when exactly 3 (cron schedules "* * * * *").
     plain = re.sub(r"^\s{0,3}(?:[-_]\s*){3,}$", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s{0,3}(?:\*\s*){3}\s*$", "", plain, flags=re.MULTILINE)
     plain = re.sub(r"^\s{0,3}#{1,6}\s+", "", plain, flags=re.MULTILINE)
     # Blockquotes, lists, and checkboxes are preserved because they carry structure.
-    plain = re.sub(r"(```+|~~~+)", "", plain)
     plain = re.sub(r"`([^`]*)`", r"\1", plain)
     plain = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", plain)
     plain = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", plain)
@@ -400,7 +426,43 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
     plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
-    return plain.strip("\n")
+    return plain
+
+
+def _strip_markdown_syntax(text: str) -> str:
+    """Best-effort markdown marker removal for plain-text display.
+
+    Fenced code blocks are opaque: their delimiter lines are dropped but their
+    contents pass through unmodified, so code copied out of the terminal is
+    not rewritten (``#`` comments losing their hash, ``__init__`` becoming
+    ``init``).
+    """
+    from cli import _rich_text_from_ansi
+    plain = _rich_text_from_ansi(text or "").plain
+    out: list[str] = []
+    prose: list[str] = []
+    fence_char = ""
+    fence_len = 0
+
+    def _flush_prose() -> None:
+        if prose:
+            out.extend(_strip_prose_markdown("\n".join(prose)).split("\n"))
+            prose.clear()
+
+    for line in plain.split("\n"):
+        marker = _code_fence_marker(line)
+        if fence_char:
+            if _closes_code_fence(marker, fence_char, fence_len):
+                fence_char = ""  # closing delimiter: drop the line itself
+            else:
+                out.append(line)  # fenced code content: unmodified
+        elif marker and not (marker[0] == "`" and "`" in marker[2]):
+            _flush_prose()
+            fence_char, fence_len = marker[0], marker[1]  # opening delimiter
+        else:
+            prose.append(line)
+    _flush_prose()
+    return "\n".join(out).strip("\n")
 
 
 _WINDOWS_PATH_WITH_DOT_SEGMENT_RE = re.compile(r"(?i)(?:\b[a-z]:\\|\\\\)[^\s`]*\\\.[^\s`]*")

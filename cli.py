@@ -104,6 +104,8 @@ from hermes_cli.cli_render import (
     _build_compact_banner,
     _clear_output_history,
     _cli_visible_print,
+    _closes_code_fence,
+    _code_fence_marker,
     _coerce_output_history_limit,
     _cprint,
     _d,

@@ -458,6 +458,33 @@ class CLIStreamMixin:
         for ln in block.split("\n"):
             self._emit_stream_line(ln)
 
+    def _consume_stream_code_fence_line(self, line: str) -> bool:
+        """Handle one streamed line under ``strip`` display code-fence rules.
+
+        Fence delimiter lines toggle ``_stream_fence_*`` state and are dropped;
+        lines inside an open fence are emitted unmodified (no marker stripping,
+        no table buffering) so code copied out of the terminal survives.
+        Returns True when the line was consumed.
+        """
+        if self.final_response_markdown != "strip":
+            return False
+        from cli import _closes_code_fence, _code_fence_marker
+        marker = _code_fence_marker(line)
+        fence_char = getattr(self, "_stream_fence_char", "")
+        if fence_char:
+            if _closes_code_fence(marker, fence_char, self._stream_fence_len):
+                self._stream_fence_char = ""  # closing delimiter: drop the line
+            else:
+                self._emit_stream_line(line)  # fenced code content: unmodified
+            return True
+        if marker and not (marker[0] == "`" and "`" in marker[2]):
+            if self._in_stream_table:
+                self._flush_stream_table_buf()  # a fence ends any open table block
+            self._stream_fence_char = marker[0]
+            self._stream_fence_len = marker[1]
+            return True  # opening delimiter: drop the line
+        return False
+
     def _emit_stream_text(self, text: str) -> None:
         """Emit filtered text to the streaming display."""
         from agent.markdown_tables import is_table_divider, looks_like_table_row
@@ -506,6 +533,8 @@ class CLIStreamMixin:
         self._stream_buf += text
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
+            if self._consume_stream_code_fence_line(line):
+                continue
             # Table rows are held and re-padded as a block once it ends (already-printed rows
             # can't be re-aligned), so a table appears in one batch when the block closes.
             if self._in_stream_table:
@@ -527,6 +556,7 @@ class CLIStreamMixin:
         if (
             self._stream_buf
             and not self._in_stream_table
+            and not getattr(self, "_stream_fence_char", "")
             and not self._stream_buf.lstrip().startswith("|")
             and len(self._stream_buf) >= 80):
             preview = self._stream_buf[-int(_STREAM_PARTIAL_PREVIEW_LEN):]
@@ -561,9 +591,20 @@ class CLIStreamMixin:
         if getattr(self, "_stream_table_buf", None):
             self._flush_stream_table_buf()
         if self._stream_buf:
-            line = _strip_markdown_syntax(self._stream_buf) if self.final_response_markdown == "strip" else self._stream_buf
-            self._emit_stream_line(line)
-            self._stream_buf = ""
+            if self.final_response_markdown == "strip":
+                from cli import _closes_code_fence, _code_fence_marker
+                if getattr(self, "_stream_fence_char", ""):
+                    # A truncated stream can end exactly on an unprefixed closing
+                    # fence: swallow it like the batch path would, keep the rest raw.
+                    if _closes_code_fence(_code_fence_marker(self._stream_buf),
+                                          self._stream_fence_char, self._stream_fence_len):
+                        self._stream_fence_char = ""
+                        self._stream_buf = ""
+                else:
+                    self._stream_buf = _strip_markdown_syntax(self._stream_buf)
+            if self._stream_buf:
+                self._emit_stream_line(self._stream_buf)
+                self._stream_buf = ""
         if self._stream_box_opened and getattr(self, "_stream_box_live", False):
             if getattr(self, "_modern_layout", False):
                 from hermes_cli.cli_modern_layout import closing_separator
@@ -591,6 +632,8 @@ class CLIStreamMixin:
         self._stream_table_buf = []
         self._in_stream_table = False
         self._stream_box_live = False
+        self._stream_fence_char = ""
+        self._stream_fence_len = 0
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
