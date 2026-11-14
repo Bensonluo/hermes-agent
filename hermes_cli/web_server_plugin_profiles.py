@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlencode
 from fastapi.responses import JSONResponse, Response
 from starlette import status
 from starlette._utils import get_route_path
+from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocket
 
 from hermes_cli.config import get_process_hermes_home
@@ -234,7 +235,8 @@ async def run_hosted_request(home: Path, name: str, call: Callable[[float], dict
 async def forward_secondary_plugin_request(request, name: str) -> Optional[Response]:
     """Serve ``/api/plugins/<name>/`` for a secondary profile through its own plugin host, or None
     when the in-process router answers (the launch profile, or a bundled plugin). Consent has been
-    checked in the request's scope already."""
+    checked in the request's scope already. A client that aborts before its body arrives gets a
+    quiet 499, not an unhandled disconnect."""
     plugin, home = _secondary_hosted_plugin(name), secondary_profile_home()
     if plugin is None or home is None:
         return None
@@ -245,7 +247,11 @@ async def forward_secondary_plugin_request(request, name: str) -> Optional[Respo
     query = urlencode([(k, v) for k, v in parse_qsl(request.url.query, keep_blank_values=True)
                        if k not in _GATEWAY_QUERY_KEYS])
     headers = [(k, v) for k, v in request.headers.items() if k.lower() not in _GATEWAY_CREDENTIAL_HEADERS]
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:  # the peer gave up mid-upload: 499 (nginx's client-closed-request), not an unhandled 500 (#155514)
+        _log.info("Plugin %s: the client aborted %s before its body arrived; nothing forwarded", name, path)
+        return Response(status_code=499)
     from hermes_cli.plugin_host_http_auth import admitted_for_sensitive_route
     authenticated = admitted_for_sensitive_route(request)
 

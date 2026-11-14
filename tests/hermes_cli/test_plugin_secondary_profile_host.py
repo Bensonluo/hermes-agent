@@ -700,3 +700,29 @@ def test_a_miss_rescan_overtaken_by_an_explicit_rescan_caches_nothing_stale(daem
     assert status("late") == 200 and overtook == [1]
     assert not [k for k in web_server_plugin_profiles._unknown_plugins if k[1] == "late"]
     assert status("late") == 200
+
+
+def test_client_aborting_the_upload_answers_499_not_an_unhandled_500(daemon, monkeypatch):
+    """The forward reads the request body inside its guard: a client that goes away mid-upload
+    (#155514) used to surface starlette's ClientDisconnect as an unhandled 500 with a full
+    traceback (measured twenty times in one deployment's dashboard.err.log); it now gets a quiet
+    499 and the profile's plugin host is never reached."""
+    from starlette.requests import ClientDisconnect, Request
+
+    imported = _beta_plugin(daemon)
+    real_body = Request.body
+
+    async def aborting_body(self):  # the peer vanishes between the headers and the body
+        if self.url.path == PING:
+            raise ClientDisconnect()
+        return await real_body(self)
+
+    monkeypatch.setattr(Request, "body", aborting_body)
+    # text/plain keeps the native-ticket scope check off the body (it parses JSON bodies only), so
+    # the forward's read is where the upload's peer vanishes — the seam #155514 reports.
+    response = daemon.client.post(PING, headers={**daemon.beta_ticket(), "content-type": "text/plain"},
+                                  content=b"partial upload")
+
+    assert response.status_code == 499
+    assert daemon.calls == []  # the plugin host was never reached
+    assert _never_imported(imported)
