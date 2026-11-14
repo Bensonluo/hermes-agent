@@ -1,5 +1,5 @@
-"""``session.delete``: argument checks, the live-session refusal, the profile's db and sessions dir, and
-the onboarding run a deleted chat ends first (moved out of test_tui_gateway_server.py)."""
+"""``session.delete``: argument checks, live-session eviction (#155831), the profile's db and sessions dir,
+and the onboarding run a deleted chat ends first (moved out of test_tui_gateway_server.py)."""
 
 from pathlib import Path
 
@@ -46,17 +46,22 @@ def test_session_delete_returns_db_unavailable_when_no_db(monkeypatch):
     assert resp["error"]["data"]["code"] == "storage_locked"
 
 
-def test_session_delete_refuses_active_session(monkeypatch):
-    """Cannot delete a session currently bound to a live TUI session."""
-    called: list[str] = []
+def test_session_delete_evicts_live_session_then_deletes(monkeypatch):
+    """A live session bound to the target key is interrupted and torn down, then the row is deleted (#155831)."""
+    events: list[str] = []
+    torn: list[dict] = []
 
     class _DB(_NoOnboardingRun):
         def delete_session(self, sid, sessions_dir=None, **_kw):
-            called.append(sid)
+            events.append("delete")
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
+    monkeypatch.setattr(server, "_interrupt_session_turn",
+                        lambda sid, session, **_kw: events.append("interrupt"))
+    monkeypatch.setattr(server, "_teardown_popped_session",
+                        lambda session, *, end_reason="tui_close": (torn.append(session) or events.append(f"teardown:{end_reason}") or True))
+    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live", "running": True})
     try:
         resp = server.handle_request(
             {
@@ -68,9 +73,131 @@ def test_session_delete_refuses_active_session(monkeypatch):
     finally:
         server._sessions.pop("live", None)
 
-    assert "error" in resp
-    assert resp["error"]["code"] == 4023
-    assert called == [], "delete_session must not be called for active sessions"
+    assert resp.get("result") == {"deleted": "key-live"}, resp
+    assert events == ["interrupt", "teardown:tui_delete", "delete"], events
+    assert torn and torn[0].get("_sid") == "live"
+    assert "live" not in server._sessions
+
+
+def test_session_delete_evicts_idle_live_session_without_interrupt(monkeypatch):
+    """An idle live record (no running turn) is still evicted, but never interrupted."""
+    events: list[str] = []
+
+    class _DB(_NoOnboardingRun):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
+            events.append("delete")
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_interrupt_session_turn",
+                        lambda sid, session, **_kw: events.append("interrupt"))
+    monkeypatch.setattr(server, "_teardown_popped_session",
+                        lambda session, *, end_reason="tui_close": (events.append(f"teardown:{end_reason}") or True))
+    monkeypatch.setitem(server._sessions, "idle", {"session_key": "key-idle"})
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.delete", "params": {"session_id": "key-idle"}}
+        )
+    finally:
+        server._sessions.pop("idle", None)
+
+    assert resp.get("result") == {"deleted": "key-idle"}, resp
+    assert events == ["teardown:tui_delete", "delete"], events
+
+
+def test_session_delete_evicts_every_live_record_for_the_key(monkeypatch):
+    """Duplicate running live records for one stored key (post-resume races) are all claimed, each one
+    interrupted, before the single row delete."""
+    events: list[str] = []
+    torn: list[str] = []
+
+    class _DB(_NoOnboardingRun):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
+            events.append("delete")
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_interrupt_session_turn",
+                        lambda sid, session, **_kw: events.append(f"interrupt:{sid}"))
+    monkeypatch.setattr(server, "_teardown_popped_session",
+                        lambda session, *, end_reason="tui_close": (torn.append(session.get("_sid")) or True))
+    monkeypatch.setitem(server._sessions, "a", {"session_key": "dup", "running": True})
+    monkeypatch.setitem(server._sessions, "b", {"session_key": "dup", "running": True})
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.delete", "params": {"session_id": "dup"}}
+        )
+    finally:
+        server._sessions.pop("a", None)
+        server._sessions.pop("b", None)
+
+    assert resp.get("result") == {"deleted": "dup"}, resp
+    assert sorted(torn) == ["a", "b"]
+    assert sorted(events) == ["delete", "interrupt:a", "interrupt:b"]
+
+
+def test_session_delete_skips_a_foreign_profile_live_record(monkeypatch):
+    """A coincidental key match in another profile's store is left alone: its row is not the one deleted."""
+    events: list[str] = []
+
+    class _DB(_NoOnboardingRun):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
+            events.append("delete")
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **_kw: events.append("interrupt"))
+    monkeypatch.setattr(server, "_teardown_popped_session",
+                        lambda session, *, end_reason="tui_close": events.append("teardown") or True)
+    monkeypatch.setitem(server._sessions, "foreign", {"session_key": "x-key", "profile_home": "/tmp/other-home"})
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.delete", "params": {"session_id": "x-key"}}
+        )
+        assert resp.get("result") == {"deleted": "x-key"}, resp
+        assert events == ["delete"], events
+        assert "foreign" in server._sessions
+    finally:
+        server._sessions.pop("foreign", None)
+
+
+def test_session_delete_refuses_when_eviction_teardown_fails(monkeypatch):
+    """Teardown failure keeps the 4023 refusal and the row — and re-queues the record, so a retry re-enters
+    eviction instead of deleting the row bare under a runtime that could not be stopped."""
+    calls: list[str] = []
+    outcomes: list[object] = ["raise", True]  # first teardown fails, the retry succeeds
+
+    class _DB(_NoOnboardingRun):
+        def delete_session(self, sid, sessions_dir=None, **_kw):
+            calls.append("delete")
+            return True
+
+    def _teardown(session, *, end_reason="tui_close"):
+        if outcomes and outcomes[0] == "raise":
+            outcomes.pop(0)
+            raise RuntimeError("finalize blew up")
+        calls.append("teardown")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **_kw: None)
+    monkeypatch.setattr(server, "_teardown_popped_session", _teardown)
+    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
+    try:
+        first = server.handle_request(
+            {"id": "1", "method": "session.delete", "params": {"session_id": "key-live"}}
+        )
+        assert first["error"]["code"] == 4023, first
+        assert "finalize blew up" in first["error"]["message"], first
+        assert calls == [], "delete_session must not run while the runtime could not be stopped"
+        assert "live" in server._sessions, "the failed eviction must re-queue the record"
+
+        second = server.handle_request(
+            {"id": "2", "method": "session.delete", "params": {"session_id": "key-live"}}
+        )
+        assert second.get("result") == {"deleted": "key-live"}, second
+        assert calls == ["teardown", "delete"], calls
+    finally:
+        server._sessions.pop("live", None)
 
 
 def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):

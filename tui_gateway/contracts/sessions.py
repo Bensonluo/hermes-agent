@@ -304,7 +304,7 @@ class SessionDeleteResult(Result):
 
 
 method("session.delete", params=SessionDeleteParams, result=SessionDeleteResult,
-       doc="Delete a stored session + transcripts; refused while it is live here.")
+       doc="Delete a stored session + transcripts; a session still live here is interrupted and torn down first.")
 
 
 class SessionTitleParams(SessionParams):

@@ -6682,7 +6682,7 @@ export interface RpcMethods {
   'session.create': { params: SessionCreateParams; result: SessionCreateResult }
   /** Change a live, idle session's working directory. */
   'session.cwd.set': { params: SessionCwdSetParams; result: SessionCwdSetResult }
-  /** Delete a stored session + transcripts; refused while it is live here. */
+  /** Delete a stored session + transcripts; a session still live here is interrupted and torn down first. */
   'session.delete': { params: SessionDeleteParams; result: SessionDeleteResult }
   /** Replay events after a seq watermark on WS reconnect; truncated means refetch state. */
   'session.events.since': { params: SessionEventsSinceParams; result: SessionEventsSinceResult }

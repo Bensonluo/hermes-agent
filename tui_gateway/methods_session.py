@@ -1166,18 +1166,17 @@ def _(rid, params: dict, session: dict) -> dict:
 
 @method("session.delete")
 def _(rid, params: dict) -> dict:
-    """Delete a stored session + transcripts; refused while live here (FK trips on the agent's next flush)."""
+    """Delete a stored session + transcripts; a runtime still live here is evicted first (FK safety)."""
     from agent.onboarding_record import delete_chat
     from hermes_state_errors import SessionActiveWriteGuardError  # body runs on server.py globals
 
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
-    snapshot, err = _snapshot_sessions(rid)
-    if err:
+    if (err := _snapshot_sessions(rid)[1]) is not None:  # fail closed when the registry can't be enumerated
         return err
-    if any(s.get("session_key") == target for _sid, s in snapshot):
-        return _err(rid, 4023, "cannot delete an active session")
     profile_home = _profile_home((params.get("profile") or "").strip() or None)
+    if err := _evict_live_sessions_for_delete(rid, target, profile_home):
+        return err
     with _profile_db(params, writer=True) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5036)

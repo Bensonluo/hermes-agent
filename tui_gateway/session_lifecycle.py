@@ -837,6 +837,55 @@ def _close_session_by_id(
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
+def _evict_live_sessions_for_delete(rid, target: str, profile_home: str | None) -> dict | None:
+    """``session.delete``'s live-session half (#155831): evict every runtime bound to *target*'s stored key in
+    the resolved profile so the caller can delete the row; returns the 4023 error response when a teardown
+    fails, else None. The in-lock scan is the single authority — the caller's pre-lock snapshot is stale the
+    moment its lock releases, so it is only used for the fail-closed registry check.
+
+    A bare row delete leaves the runtime's next append flushing into a gone row (#123583), which is why the
+    RPC used to refuse while live — but presence alone stranded clients that never send ``session.close``
+    first. Claims under ``_session_resume_lock`` like ``session.close``, so a concurrent resume either
+    registered before the claim (and is claimed here too) or re-registers only after the pop; a resume that
+    already read the row can still race the later row delete, the same window ``hermes sessions delete`` from
+    another process has always had. A running turn is interrupted first — ``session.interrupt``'s contract —
+    so teardown settles inside its grace instead of eating it. A failed teardown re-queues the record, so the
+    refusal stays actionable and a retry re-enters eviction instead of bare-deleting the row under a runtime
+    that could not be stopped."""
+    from hermes_constants import get_hermes_home
+    expected_home = str(Path(profile_home or get_hermes_home()).resolve())
+    with _session_resume_lock, _sessions_lock:
+        claimed = []
+        for sid, session in list(_sessions.items()):
+            if session.get("session_key") != target:
+                continue
+            # A coincidental key match in another profile's store is not ours to guard: its row lives in that
+            # store, so only the resolved profile's runtimes are torn down.
+            live_home = str(Path(session.get("profile_home") or get_hermes_home()).resolve())
+            if live_home == expected_home and (popped := _pop_session_by_id(sid)) is not None:
+                claimed.append(popped)
+    failures: list[str] = []
+    for session in claimed:
+        try:
+            if session.get("running"):
+                _interrupt_session_turn(str(session.get("_sid") or ""), session)
+            _teardown_popped_session(session, end_reason="tui_delete")
+        except Exception as exc:
+            logger.warning("session.delete: live-session teardown failed for %s", target, exc_info=True)
+            _requeue_failed_eviction(session)
+            failures.append(str(exc))
+    if failures:
+        return _err(rid, 4023, f"cannot delete an active session: {'; '.join(failures)}")
+    return None
+
+
+def _requeue_failed_eviction(session: dict) -> None:
+    """Put a record whose teardown failed back in the registry (first-wins) so its row stays guarded: the
+    delete is refused and a retry re-enters eviction instead of deleting the row bare (#123583)."""
+    with _sessions_lock:
+        _sessions.setdefault(str(session.get("_sid") or ""), session)
+
+
 def _ws_session_is_detached(session: dict | None) -> bool:
     """True if a live session is still bound to the disconnected-WS sentinel."""
     return bool(session and not session.get("_finalized") and session.get("transport") is _detached_ws_transport)

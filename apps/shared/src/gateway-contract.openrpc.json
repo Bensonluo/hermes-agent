@@ -3392,7 +3392,7 @@
     },
     {
       "name": "session.delete",
-      "summary": "Delete a stored session + transcripts; refused while it is live here.",
+      "summary": "Delete a stored session + transcripts; a session still live here is interrupted and torn down first.",
       "params": [
         {
           "name": "params",
