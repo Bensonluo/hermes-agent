@@ -192,11 +192,15 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
-def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
+def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> str | None:
     """Intentional workspace move from the project_* tools: re-anchor the live session's cwd
-    and push session.info. The ONLY auto-cwd path — an explicit tool call, never a `cd`."""
+    and push session.info. The ONLY auto-cwd path — an explicit tool call, never a `cd`.
+
+    Returns ``None`` when the session re-anchored, else a reason the tool reports instead of a
+    silent success: the folder may not exist on the gateway host (e.g. a container-only path
+    under a Docker terminal backend), or the chat may have no live session anymore (#155930)."""
     if not path:
-        return
+        return "project has no primary folder"
     # task_id is the durable session_key; _sessions (and desktop event routing) key by sid.
     key = str(task_id or "")
     with _sessions_lock:
@@ -205,13 +209,17 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
              if c.get("session_key") == key or getattr(c.get("agent"), "session_id", None) == key),
             ("", None))
     resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if session is None or not os.path.isdir(resolved):
-        return
-    # explicit switch supersedes a settle-adopted cwd
+    if session is None:
+        return "no live session for this chat"
+    if not os.path.isdir(resolved):
+        return f"primary folder is not a directory on the gateway host: {resolved}"
+    # The re-anchor below is the point of no return: everything after it (override registration,
+    # persistence, git metadata, the info push) is best-effort sync, and a failure there must not
+    # turn an applied move into a reported rejection (#155930).
     session.update(cwd=resolved, explicit_cwd=True, cwd_from_settle=False)
-    _register_session_cwd(session)
-    _persist_session_cwd_and_schedule_git_meta(session, resolved)
     try:
+        _register_session_cwd(session)
+        _persist_session_cwd_and_schedule_git_meta(session, resolved)
         agent = session.get("agent")
         info = _session_info(agent, session) if agent is not None else {
             "cwd": resolved, "branch": git_probe.branch(resolved),
@@ -219,7 +227,8 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
             "desktop_contract": DESKTOP_BACKEND_CONTRACT}
         _emit("session.info", sid, info)
     except Exception:
-        logger.debug("failed to emit session.info after project workspace move", exc_info=True)
+        logger.debug("post-move workspace sync failed after the session re-anchored", exc_info=True)
+    return None
 
 
 def _wire_callbacks(sid: str):

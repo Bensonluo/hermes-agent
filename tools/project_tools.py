@@ -8,17 +8,21 @@ session create/switch re-anchors only that session; it must not move the profile
 Desktop selection shared by concurrent chats."""
 
 import json
+import logging
 import os
 from typing import Callable, Optional
 
 from tools.registry import registry
 
+logger = logging.getLogger(__name__)
+
 # Set by the GUI gateway: ``(task_id, primary_path, project_name)`` re-anchors that session's
-# workspace. ``None`` in CLI/messaging — the DB write still happens, nothing to move.
-_workspace_callback: Optional[Callable[[str, str, str], None]] = None
+# workspace, returning ``None`` when it did or a reason string when a move was expected but
+# didn't apply. ``None`` in CLI/messaging — the DB write still happens, nothing to move.
+_workspace_callback: Optional[Callable[[str, str, str], Optional[str]]] = None
 
 
-def set_project_workspace_callback(fn: Optional[Callable[[str, str, str], None]]) -> None:
+def set_project_workspace_callback(fn: Optional[Callable[[str, str, str], Optional[str]]]) -> None:
     global _workspace_callback
     _workspace_callback = fn
 
@@ -37,13 +41,17 @@ def _moves_session(task_id: Optional[str], path: Optional[str]) -> bool:
     return bool(_workspace_callback and task_id and path)
 
 
-def _apply_workspace(task_id: Optional[str], path: Optional[str], name: str) -> None:
+def _apply_workspace(task_id: Optional[str], path: Optional[str], name: str) -> Optional[str]:
+    """``None`` when the live session followed the project (or nothing was expected to move);
+    a reason string when the move was rejected before the session re-anchored (#155930)."""
     cb = _workspace_callback
     if cb and task_id and path:
         try:
-            cb(task_id, path, name)
-        except Exception:
-            pass
+            return cb(task_id, path, name)
+        except Exception as exc:
+            logger.debug("project workspace move failed", exc_info=True)
+            return f"workspace move failed: {exc}"
+    return None
 
 
 def _resolve(conn, token: str):
@@ -65,10 +73,15 @@ def _resolve(conn, token: str):
 
 def _activated(proj, task_id: Optional[str]) -> str:
     primary = _primary_path(proj)
-    _apply_workspace(task_id, primary, proj.name)
-    return json.dumps({
-        "success": True, "id": proj.id, "slug": proj.slug, "name": proj.name,
-        "primary_path": primary})
+    move_failed = _apply_workspace(task_id, primary, proj.name)
+    # A GUI move the gateway rejected must not claim success: the session kept its workspace and
+    # the profile-global pointer wasn't switched either, so nothing followed the project (#155930).
+    payload = {
+        "success": move_failed is None, "id": proj.id, "slug": proj.slug, "name": proj.name,
+        "primary_path": primary}
+    if move_failed is not None:
+        payload["error"] = move_failed
+    return json.dumps(payload)
 
 
 def _calling_session_project_id(conn, task_id: Optional[str]) -> tuple[bool, Optional[str]]:

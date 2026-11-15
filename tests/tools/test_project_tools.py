@@ -244,3 +244,105 @@ def test_idempotent_create_from_a_session_keeps_profile_active_pointer(gui_sessi
     assert tab["cwd"] == str(folders["existing"])
     with pdb.connect_closing() as conn:
         assert pdb.get_active_id(conn) == foreground
+
+
+def test_switch_reports_failure_when_the_primary_folder_is_missing_on_the_gateway_host(gui_sessions, tmp_path):
+    """A container-only path (e.g. a Docker terminal backend) can be valid to the agent yet absent
+    on the gateway host: the switch must report failure, not a silent success (#155930)."""
+    missing = tmp_path / "gone"
+    with pdb.connect_closing() as conn:
+        foreground = pdb.create_project(conn, name="Foreground", folders=[str(tmp_path / "fg")])
+        pdb.set_active(conn, foreground)
+        pdb.create_project(conn, name="Gone", folders=[str(missing)])
+    tab = gui_sessions("tab", str(tmp_path))
+
+    result = _tool("switch", "tab", name="Gone")
+
+    assert result["success"] is False
+    assert str(missing) in result["error"]
+    assert "is not a directory on the gateway host" in result["error"]
+    assert tab["cwd"] == str(tmp_path)  # the session stayed where it was
+    with pdb.connect_closing() as conn:
+        assert pdb.get_active_id(conn) == foreground  # the profile pointer kept its exact value
+
+
+def test_a_file_at_the_primary_path_is_rejected_as_a_workspace(gui_sessions, tmp_path):
+    not_a_dir = tmp_path / "file-project"
+    not_a_dir.write_text("regular file, not a folder")
+    with pdb.connect_closing() as conn:
+        pdb.create_project(conn, name="FileProject", folders=[str(not_a_dir)])
+    tab = gui_sessions("tab", str(tmp_path))
+
+    result = _tool("switch", "tab", name="FileProject")
+
+    assert result["success"] is False
+    assert "is not a directory on the gateway host" in result["error"]
+    assert tab["cwd"] == str(tmp_path)
+
+
+def test_switch_reports_failure_when_no_live_session_matches(gui_sessions, tmp_path):
+    folder = tmp_path / "project"
+    folder.mkdir()
+    with pdb.connect_closing() as conn:
+        pdb.create_project(conn, name="Project", folders=[str(folder)])
+
+    result = _tool("switch", "ghost-tab", name="Project")
+
+    assert result["success"] is False
+    assert result["error"] == "no live session for this chat"
+
+
+def test_a_successful_move_through_the_real_callback_reports_success(gui_sessions, tmp_path):
+    """Names with spaces and Unicode must move and answer success without an error field."""
+    folder = tmp_path / "próject dir"
+    folder.mkdir()
+    with pdb.connect_closing() as conn:
+        project = pdb.create_project(conn, name="Project", folders=[str(folder)])
+    tab = gui_sessions("tab", str(tmp_path))
+
+    result = _tool("switch", "tab", name="Project")
+
+    assert result["success"] is True
+    assert "error" not in result
+    assert result["id"] == project
+    assert tab["cwd"] == str(folder)
+
+
+def test_a_post_move_sync_failure_still_reports_the_move_as_applied(gui_sessions, tmp_path, monkeypatch):
+    """A best-effort sync failure after the re-anchor (persistence, git metadata, info push)
+    must not turn an applied move into a reported rejection (#155930)."""
+    from tui_gateway import server
+
+    def boom_sync(*args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(server, "_persist_session_cwd_and_schedule_git_meta", boom_sync)
+    folder = tmp_path / "project"
+    folder.mkdir()
+    with pdb.connect_closing() as conn:
+        pdb.create_project(conn, name="Project", folders=[str(folder)])
+    tab = gui_sessions("tab", str(tmp_path))
+
+    result = _tool("switch", "tab", name="Project")
+
+    assert result["success"] is True
+    assert "error" not in result
+    assert tab["cwd"] == str(folder)
+
+
+def test_a_workspace_callback_failure_is_reported_not_swallowed(monkeypatch, tmp_path):
+    db_path, connect_closing = _use_projects_db(monkeypatch, tmp_path)
+    with connect_closing(db_path=db_path) as conn:
+        pdb.create_project(conn, name="Target", folders=[str(tmp_path)])
+
+    def boom(*args):
+        raise RuntimeError("gateway move exploded")
+
+    project_tools.set_project_workspace_callback(boom)
+    try:
+        result = _tool("switch", "session-a", name="Target")
+    finally:
+        project_tools.set_project_workspace_callback(None)
+
+    assert result["success"] is False
+    assert "gateway move exploded" in result["error"]
